@@ -19,11 +19,18 @@ from tennis_booking.common.tz import ALMATY
 
 from .codes import CONFIG_ERROR_CODES, NOT_OPEN_CODES, SLOT_TAKEN_CODES
 
-__all__ = ["AttemptConfig", "AttemptResult", "BookingAttempt"]
+__all__ = [
+    "AttemptConfig",
+    "AttemptPhase",
+    "AttemptResult",
+    "AttemptStatus",
+    "BookingAttempt",
+]
 
 _logger = structlog.get_logger(__name__)
 
 AttemptStatus = Literal["won", "lost", "timeout", "error"]
+AttemptPhase = Literal["window", "poll"]
 
 _TIGHT_LOOP_LEAD_S = 1.0
 _TIGHT_LOOP_STEP_S = 0.001
@@ -129,6 +136,7 @@ class AttemptResult:
     prearm_ok: bool
     shots_fired: int
     attempt_id: str = field(default="")
+    phase: AttemptPhase | None = None
 
 
 class BookingAttempt:
@@ -631,4 +639,5 @@ class BookingAttempt:
             prearm_ok=prearm_ok,
             shots_fired=shots_fired,
             attempt_id=self._attempt_id,
+            phase="window",
         )

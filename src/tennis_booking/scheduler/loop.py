@@ -18,6 +18,7 @@ from tennis_booking.engine.attempt import (
     AttemptResult,
     BookingAttempt,
 )
+from tennis_booking.engine.poll import PollAttempt, PollConfigData
 from tennis_booking.scheduler.clock import CheckResult, check_ntp_drift
 from tennis_booking.scheduler.clock_errors import (
     ClockDriftError,
@@ -32,6 +33,7 @@ __all__ = [
     "SHUTDOWN_TIMEOUT_S",
     "AttemptFactory",
     "NTPChecker",
+    "PollAttemptFactory",
     "ScheduledAttempt",
     "SchedulerLoop",
 ]
@@ -66,6 +68,9 @@ class ScheduledAttempt:
 
 
 AttemptFactory = Callable[[AttemptConfig, AltegioClient, Clock], BookingAttempt]
+PollAttemptFactory = Callable[
+    [AttemptConfig, PollConfigData, AltegioClient, Clock, asyncio.Event], PollAttempt
+]
 NTPChecker = Callable[[], Awaitable[CheckResult]]
 
 
@@ -75,6 +80,16 @@ def _default_attempt_factory(
     return BookingAttempt(config, client, clock)
 
 
+def _default_poll_attempt_factory(
+    config: AttemptConfig,
+    poll: PollConfigData,
+    client: AltegioClient,
+    clock: Clock,
+    won_event: asyncio.Event,
+) -> PollAttempt:
+    return PollAttempt(config, poll, client, clock, won_event=won_event)
+
+
 def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
     async def _check() -> CheckResult:
         return await check_ntp_drift(threshold_ms=threshold_ms)
@@ -82,19 +97,27 @@ def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
     return _check
 
 
+# Suffix appended to the base scheduled key for poll-mode tasks. Window task
+# uses the bare key (backward compat with existing dedup logic).
+_POLL_KEY_SUFFIX = ":poll"
+
+
 def _scheduled_key(
     booking_name: str,
     slot_dt_local: datetime,
     court_ids: tuple[int, ...],
     service_id: int,
-) -> tuple[str, str, int, int]:
+    suffix: str = "",
+) -> tuple[str, str, int, int, str]:
     # Two BookingRule's can legally share a `name` (config loader dedupes by
     # (weekday, slot_time, court_id), not name) — for example "Вечер" on court 5
     # and "Вечер" on court 6 when the user wants either court. Keying only by
     # (name, slot) would silently drop one of them as a duplicate.
     # `court_ids` is a tuple (immutable) → hashable; hash is deterministic for
     # same tuple, so re-spawn after recompute keeps the same key.
-    return (booking_name, slot_dt_local.isoformat(), hash(court_ids), service_id)
+    # `suffix` differentiates window-task ("") and poll-task (":poll") keys
+    # for the same booking — both run concurrently, sharing won_event.
+    return (booking_name, slot_dt_local.isoformat(), hash(court_ids), service_id, suffix)
 
 
 class SchedulerLoop:
@@ -114,6 +137,7 @@ class SchedulerLoop:
         ntp_required: bool = True,
         ntp_threshold_ms: int = DEFAULT_NTP_THRESHOLD_MS,
         attempt_factory: AttemptFactory | None = None,
+        poll_attempt_factory: PollAttemptFactory | None = None,
         ntp_checker: NTPChecker | None = None,
         shutdown_timeout_s: float = SHUTDOWN_TIMEOUT_S,
     ) -> None:
@@ -127,6 +151,11 @@ class SchedulerLoop:
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
+        self._poll_attempt_factory: PollAttemptFactory = (
+            poll_attempt_factory
+            if poll_attempt_factory is not None
+            else _default_poll_attempt_factory
+        )
         self._ntp_checker: NTPChecker = (
             ntp_checker if ntp_checker is not None else _default_ntp_checker(ntp_threshold_ms)
         )
@@ -134,13 +163,31 @@ class SchedulerLoop:
         self._loop_id = uuid.uuid4().hex
         self._log = structlog.get_logger("scheduler.loop").bind(loop_id=self._loop_id)
 
-        self._scheduled: dict[tuple[str, str, int, int], asyncio.Task[None]] = {}
+        self._scheduled: dict[tuple[str, str, int, int, str], asyncio.Task[None]] = {}
         # Tasks that crossed into the "running" (post-prearm) phase. On stop(), these
         # are awaited (with deadline) instead of being cancelled — losing a slot
         # mid-fire because of SIGTERM is the worst possible outcome.
         self._running: set[asyncio.Task[None]] = set()
+        # Per-booking-occurrence shared event. Window-task and poll-task for the
+        # same (booking, slot) coordinate via this — first to fire calls .set(),
+        # the other observes and bails out before duplicating the booking.
+        self._won_events: dict[tuple[str, str, int, int], asyncio.Event] = {}
         self._stop_event = asyncio.Event()
         self._stopped = False
+
+    def _won_event_for(
+        self,
+        booking_name: str,
+        slot_dt_local: datetime,
+        court_ids: tuple[int, ...],
+        service_id: int,
+    ) -> asyncio.Event:
+        key = (booking_name, slot_dt_local.isoformat(), hash(court_ids), service_id)
+        evt = self._won_events.get(key)
+        if evt is None:
+            evt = asyncio.Event()
+            self._won_events[key] = evt
+        return evt
 
     # --- public API -----------------------------------------------------
 
@@ -288,37 +335,84 @@ class SchedulerLoop:
 
     def _spawn_attempts(self, scheduled: list[ScheduledAttempt]) -> None:
         for sa in scheduled:
-            key = _scheduled_key(
-                sa.booking.name,
-                sa.slot_dt_local,
-                sa.booking.court_ids,
-                sa.booking.service_id,
-            )
-            existing = self._scheduled.get(key)
-            if existing is not None and not existing.done():
-                self._log.info(
-                    "attempt_skipped_duplicate",
-                    booking_name=sa.booking.name,
-                    slot_dt_local=sa.slot_dt_local.isoformat(),
-                )
-                continue
-            task = asyncio.create_task(
-                self._wait_and_attempt(sa),
-                name=f"attempt:{sa.booking.name}:{sa.slot_dt_local.isoformat()}",
-            )
-            self._scheduled[key] = task
+            self._spawn_window_task(sa)
+            if sa.booking.poll is not None:
+                self._spawn_poll_task(sa)
+
+    def _spawn_window_task(self, sa: ScheduledAttempt) -> None:
+        key = _scheduled_key(
+            sa.booking.name,
+            sa.slot_dt_local,
+            sa.booking.court_ids,
+            sa.booking.service_id,
+        )
+        existing = self._scheduled.get(key)
+        if existing is not None and not existing.done():
             self._log.info(
-                "attempt_scheduled",
+                "attempt_skipped_duplicate",
                 booking_name=sa.booking.name,
-                court_ids=sa.booking.court_ids,
-                pool_name=sa.booking.pool_name,
                 slot_dt_local=sa.slot_dt_local.isoformat(),
-                window_open_utc=sa.window_open_utc.isoformat(),
+                phase="window",
             )
+            return
+        task = asyncio.create_task(
+            self._wait_and_attempt(sa),
+            name=f"attempt:{sa.booking.name}:{sa.slot_dt_local.isoformat()}",
+        )
+        self._scheduled[key] = task
+        self._log.info(
+            "attempt_scheduled",
+            booking_name=sa.booking.name,
+            court_ids=sa.booking.court_ids,
+            pool_name=sa.booking.pool_name,
+            slot_dt_local=sa.slot_dt_local.isoformat(),
+            window_open_utc=sa.window_open_utc.isoformat(),
+            phase="window",
+        )
+
+    def _spawn_poll_task(self, sa: ScheduledAttempt) -> None:
+        assert sa.booking.poll is not None
+        key = _scheduled_key(
+            sa.booking.name,
+            sa.slot_dt_local,
+            sa.booking.court_ids,
+            sa.booking.service_id,
+            suffix=_POLL_KEY_SUFFIX,
+        )
+        existing = self._scheduled.get(key)
+        if existing is not None and not existing.done():
+            self._log.info(
+                "attempt_skipped_duplicate",
+                booking_name=sa.booking.name,
+                slot_dt_local=sa.slot_dt_local.isoformat(),
+                phase="poll",
+            )
+            return
+        task = asyncio.create_task(
+            self._wait_and_poll(sa),
+            name=f"poll:{sa.booking.name}:{sa.slot_dt_local.isoformat()}",
+        )
+        self._scheduled[key] = task
+        self._log.info(
+            "attempt_scheduled",
+            booking_name=sa.booking.name,
+            court_ids=sa.booking.court_ids,
+            pool_name=sa.booking.pool_name,
+            slot_dt_local=sa.slot_dt_local.isoformat(),
+            phase="poll",
+            poll_interval_s=sa.booking.poll.interval_s,
+            poll_start_offset_days=sa.booking.poll.start_offset_days,
+        )
 
     async def _wait_and_attempt(self, scheduled: ScheduledAttempt) -> None:
         booking = scheduled.booking
         key = _scheduled_key(
+            booking.name,
+            scheduled.slot_dt_local,
+            booking.court_ids,
+            booking.service_id,
+        )
+        won_event = self._won_event_for(
             booking.name,
             scheduled.slot_dt_local,
             booking.court_ids,
@@ -331,6 +425,7 @@ class SchedulerLoop:
             pool_name=booking.pool_name,
             slot_dt_local=scheduled.slot_dt_local.isoformat(),
             window_open_utc=scheduled.window_open_utc.isoformat(),
+            phase="window",
         )
 
         try:
@@ -348,6 +443,10 @@ class SchedulerLoop:
             if current_task is not None:
                 self._running.add(current_task)
 
+            if won_event.is_set():
+                log.info("attempt_skipped_sibling_won")
+                return
+
             await self._pre_attempt_ntp_check(log)
 
             log.info("attempt_starting")
@@ -364,6 +463,9 @@ class SchedulerLoop:
                 )
                 return
 
+            if result.status == "won":
+                won_event.set()
+
             log.info(
                 "attempt_finished",
                 status=result.status,
@@ -372,6 +474,7 @@ class SchedulerLoop:
                 duration_ms=result.duration_ms,
                 shots_fired=result.shots_fired,
                 attempt_id=result.attempt_id,
+                phase=result.phase,
             )
         except asyncio.CancelledError:
             raise
@@ -386,6 +489,116 @@ class SchedulerLoop:
             current_task = asyncio.current_task()
             if current_task is not None:
                 self._running.discard(current_task)
+            self._cleanup_won_event_if_done(
+                booking.name,
+                scheduled.slot_dt_local,
+                booking.court_ids,
+                booking.service_id,
+            )
+
+    async def _wait_and_poll(self, scheduled: ScheduledAttempt) -> None:
+        booking = scheduled.booking
+        assert booking.poll is not None
+        key = _scheduled_key(
+            booking.name,
+            scheduled.slot_dt_local,
+            booking.court_ids,
+            booking.service_id,
+            suffix=_POLL_KEY_SUFFIX,
+        )
+        won_event = self._won_event_for(
+            booking.name,
+            scheduled.slot_dt_local,
+            booking.court_ids,
+            booking.service_id,
+        )
+
+        log = self._log.bind(
+            booking_name=booking.name,
+            court_ids=booking.court_ids,
+            pool_name=booking.pool_name,
+            slot_dt_local=scheduled.slot_dt_local.isoformat(),
+            phase="poll",
+        )
+
+        try:
+            attempt_cfg = self._build_attempt_config(scheduled)
+            poll_data = PollConfigData(
+                interval_s=booking.poll.interval_s,
+                start_offset_days=booking.poll.start_offset_days,
+            )
+
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._running.add(current_task)
+
+            log.info("poll_starting")
+            attempt = self._poll_attempt_factory(
+                attempt_cfg, poll_data, self._client, self._clock, won_event
+            )
+            try:
+                result: AttemptResult = await attempt.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "attempt_crashed",
+                    error=str(e),
+                    exc_type=type(e).__name__,
+                )
+                return
+
+            if result.status == "won":
+                won_event.set()
+
+            log.info(
+                "attempt_finished",
+                status=result.status,
+                business_code=result.business_code,
+                transport_cause=result.transport_cause,
+                duration_ms=result.duration_ms,
+                shots_fired=result.shots_fired,
+                attempt_id=result.attempt_id,
+                phase=result.phase,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "attempt_crashed",
+                error=str(e),
+                exc_type=type(e).__name__,
+            )
+        finally:
+            self._scheduled.pop(key, None)
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._running.discard(current_task)
+            self._cleanup_won_event_if_done(
+                booking.name,
+                scheduled.slot_dt_local,
+                booking.court_ids,
+                booking.service_id,
+            )
+
+    def _cleanup_won_event_if_done(
+        self,
+        booking_name: str,
+        slot_dt_local: datetime,
+        court_ids: tuple[int, ...],
+        service_id: int,
+    ) -> None:
+        """Remove the shared won_event once both window and poll tasks for this
+        (booking, slot) have exited. Prevents indefinite growth across recomputes.
+        """
+        win_key = _scheduled_key(booking_name, slot_dt_local, court_ids, service_id)
+        poll_key = _scheduled_key(
+            booking_name, slot_dt_local, court_ids, service_id, suffix=_POLL_KEY_SUFFIX
+        )
+        if win_key in self._scheduled or poll_key in self._scheduled:
+            return
+        evt_key = (booking_name, slot_dt_local.isoformat(), hash(court_ids), service_id)
+        self._won_events.pop(evt_key, None)
 
     async def _pre_attempt_ntp_check(self, log: Any) -> None:
         try:

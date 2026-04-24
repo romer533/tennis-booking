@@ -89,6 +89,20 @@ class Profile(BaseModel):
         return f"<profile:{self.name}>"
 
 
+class PollConfig(BaseModel):
+    """Параметры poll mode — мониторинг is_bookable через search/timeslots.
+
+    Poll-attempt запускается за `start_offset_days` суток до slot_dt_local и
+    каждые `interval_s` секунд опрашивает API. При is_bookable=True — сразу
+    fire booking. Останавливается при достижении slot_dt_local.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    interval_s: int = Field(ge=10)
+    start_offset_days: int = Field(ge=1, le=30)
+
+
 class CourtPool(BaseModel):
     """Группа кортов одного service_id. Одна booking-запись с court_pool: <name>
     будет fan-out'иться параллельными shots на все courts в пуле; first-success
@@ -136,6 +150,7 @@ class BookingRule(BaseModel):
     court_pool: str | None = None
     profile: str
     enabled: bool = True
+    poll: PollConfig | None = None
 
     @field_validator("name")
     @classmethod
@@ -235,6 +250,7 @@ class ResolvedBooking(BaseModel):
     profile: Profile
     enabled: bool
     pool_name: str | None = None
+    poll: PollConfig | None = None
 
     @field_validator("court_ids", mode="before")
     @classmethod

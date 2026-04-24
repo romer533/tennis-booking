@@ -276,6 +276,7 @@ def _resolve(
                 profile=profiles[rule.profile],
                 enabled=rule.enabled,
                 pool_name=pool_name,
+                poll=rule.poll,
             )
         )
     return tuple(resolved)
