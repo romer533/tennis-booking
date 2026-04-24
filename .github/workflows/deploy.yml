@@ -9,13 +9,50 @@ concurrency:
   group: deploy-production
   cancel-in-progress: false
 
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/tennis-booking
+
 jobs:
-  deploy:
+  build-and-push:
     runs-on: ubuntu-latest
-    # Run only after CI is green. Using `needs:` across workflows requires a
-    # shared trigger — simplest path is relying on branch protection to gate
-    # `push: branches: [main]` itself. If you add required checks in the repo
-    # settings, set them on this workflow too so failed CI cannot deploy.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.tags.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: tags
+        run: |
+          short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "sha_tag=sha-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
     steps:
       - name: Install SSH key
         env:
@@ -33,35 +70,38 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
           PORT: ${{ secrets.DEPLOY_PORT }}
           USER: ${{ secrets.DEPLOY_USER }}
+          IMAGE: ${{ env.IMAGE_NAME }}
         run: |
-          ssh -i ~/.ssh/deploy_key -p "$PORT" "$USER@$HOST" bash -s <<'EOF'
+          ssh -i ~/.ssh/deploy_key -p "$PORT" "$USER@$HOST" \
+              IMAGE="$IMAGE" bash -s <<'EOF'
           set -euo pipefail
-          cd /opt/tennis-booking
-          git fetch origin main
-          git reset --hard origin/main
-          ./venv/bin/pip install -e . --quiet
+          echo "pulling ${IMAGE}:latest"
+          sudo docker pull "${IMAGE}:latest"
+          echo "restarting tennis-booking"
           sudo systemctl restart tennis-booking
           # Post-restart health gate. is-active retries briefly — service may be
           # in `activating` state for a beat after restart.
+          sleep 3
           for i in 1 2 3 4 5; do
               if sudo systemctl is-active tennis-booking >/dev/null; then
-                  echo "service active after ${i}s"
+                  echo "service active after $((i + 3))s"
                   break
               fi
               sleep 1
               if [ "$i" = "5" ]; then
-                  echo "ERROR: service not active after 5s"
+                  echo "ERROR: service not active after 8s"
                   sudo systemctl status tennis-booking --no-pager || true
                   echo "=== last 50 log lines ==="
                   sudo journalctl -u tennis-booking -n 50 --no-pager || true
                   exit 1
               fi
           done
-          echo "=== last 20 log lines ==="
-          sudo journalctl -u tennis-booking -n 20 --no-pager
+          echo "=== last 30 log lines ==="
+          sudo journalctl -u tennis-booking -n 30 --no-pager
           EOF
 
       - name: Report status
         if: always()
         run: |
           echo "Deploy status: ${{ job.status }}"
+          echo "Image: ${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}"

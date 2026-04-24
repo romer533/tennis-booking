@@ -1,44 +1,34 @@
 [Unit]
 Description=Tennis booking automation (Altegio)
 Documentation=https://github.com/RomanGoltsov/tennis-booking
-After=network-online.target chronyd.service
-Wants=network-online.target chronyd.service
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=whimpy
-Group=whimpy
-WorkingDirectory=/opt/tennis-booking
-EnvironmentFile=/etc/tennis-booking/env
-ExecStart=/opt/tennis-booking/venv/bin/python -m tennis_booking --config-dir=/etc/tennis-booking
 Restart=always
-RestartSec=5
+RestartSec=10
 # Must be >= scheduler SHUTDOWN_TIMEOUT_S (60s) + buffer; losing an in-flight
-# booking attempt mid-fire is worse than a slow restart.
+# booking attempt mid-fire is worse than a slow restart. `docker stop -t 60`
+# inside ExecStop gives the container 60s for graceful shutdown; systemd's
+# TimeoutStopSec=70 is the outer envelope.
 TimeoutStopSec=70
-KillSignal=SIGTERM
 
-# Security hardening — service only needs to read config, write logs, talk HTTPS.
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/tennis-booking
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-LockPersonality=true
-RestrictSUIDSGID=true
-RestrictNamespaces=true
-RestrictRealtime=true
+# Always start from a clean slate — `--rm` in `docker run` covers normal
+# stops, but a crashed dockerd or `kill -9` can leave a stale container.
+ExecStartPre=-/usr/bin/docker rm -f tennis-booking
+ExecStart=/usr/bin/docker run --rm --name tennis-booking \
+    --env-file /etc/tennis-booking/env \
+    -v /var/lib/tennis-booking/config:/app/config:ro \
+    -v /var/lib/tennis-booking/logs:/app/logs \
+    -v /var/lib/tennis-booking/data:/app/data \
+    ghcr.io/romer533/tennis-booking:latest
+ExecStop=/usr/bin/docker stop -t 60 tennis-booking
 
-# stdout/stderr → systemd journal (StandardOutput=journal is the default, explicit
-# here for clarity). Python also writes to /var/log/tennis-booking/service.log via
-# RotatingFileHandler — the two sinks are complementary, not redundant.
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=tennis-booking
+# Container handles its own isolation (non-root user, mount points). systemd
+# hardening directives (ProtectSystem, etc.) apply to the wrapped `docker run`
+# process, not the container — they are dropped here as misleading.
 
 [Install]
 WantedBy=multi-user.target
