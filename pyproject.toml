@@ -45,3 +45,5 @@ files = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: slow tests hitting real NTP server (skip by default)"]
+addopts = "-m 'not integration'"
