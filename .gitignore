@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# tennis-booking: секретные конфиги и сырые данные исследования
+config/profiles.yaml
+config/schedule.yaml
+*.har
+docs/api-research-raw/
+.env
+.env.*
+!.env.example

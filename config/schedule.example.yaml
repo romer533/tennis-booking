@@ -1,0 +1,19 @@
+# Пример расписания. Скопируйте в config/schedule.yaml и отредактируйте.
+# Реальный config/schedule.yaml — в .gitignore.
+
+bookings:
+  - name: "Пятница вечер, парный"
+    weekday: friday
+    slot_local_time: "18:00"
+    duration_minutes: 60
+    court_id: 0  # заполнить после Phase 0 (см. docs/api-research.md)
+    profile: roman
+    enabled: true
+
+  - name: "Воскресенье утро"
+    weekday: sunday
+    slot_local_time: "09:00"
+    duration_minutes: 60
+    court_id: 0
+    profile: roman
+    enabled: false

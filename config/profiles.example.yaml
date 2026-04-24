@@ -1,0 +1,8 @@
+# Пример профилей клиентов. Скопируйте в config/profiles.yaml и отредактируйте.
+# Реальный config/profiles.yaml — в .gitignore, содержит ФИО и телефоны.
+
+profiles:
+  roman:
+    full_name: "Иванов Иван Иванович"
+    phone: "+77001234567"
+    email: "example@example.com"
