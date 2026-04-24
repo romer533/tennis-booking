@@ -159,6 +159,7 @@ def _make_poll_factory(
         client: AltegioClient,
         clock: Clock,
         won_event: asyncio.Event,
+        store: Any = None,
     ) -> PollAttempt:
         instance = FakePollAttempt(
             config, poll, client, clock, won_event, result=result, delay_s=delay_s

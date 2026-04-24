@@ -16,6 +16,8 @@ from tennis_booking.altegio import (
 )
 from tennis_booking.common.clock import Clock
 from tennis_booking.common.tz import ALMATY
+from tennis_booking.persistence import BookedSlot, BookingStore
+from tennis_booking.persistence.models import PROFILE_NAME_RE, SCHEMA_VERSION
 
 from .codes import CONFIG_ERROR_CODES, NOT_OPEN_CODES, SLOT_TAKEN_CODES
 
@@ -55,6 +57,7 @@ class AttemptConfig:
     service_id: int
     fullname: str
     phone: str
+    profile_name: str
     email: str | None = None
     parallel_shots: int = 2
     not_open_retry_ms: int = 100
@@ -92,6 +95,12 @@ class AttemptConfig:
             raise ValueError("fullname must not be empty after strip")
         if not self.phone.strip():
             raise ValueError("phone must not be empty after strip")
+        if not isinstance(self.profile_name, str) or not PROFILE_NAME_RE.fullmatch(
+            self.profile_name
+        ):
+            raise ValueError(
+                f"profile_name must match [a-z0-9_-]+, got {self.profile_name!r}"
+            )
         if self.parallel_shots < 1:
             raise ValueError(f"parallel_shots must be >= 1, got {self.parallel_shots}")
         if self.not_open_retry_ms < 10:
@@ -148,10 +157,17 @@ class BookingAttempt:
             → retry_loop (not_open / transport) → (won | lost | timeout | error)
     """
 
-    def __init__(self, config: AttemptConfig, client: AltegioClient, clock: Clock) -> None:
+    def __init__(
+        self,
+        config: AttemptConfig,
+        client: AltegioClient,
+        clock: Clock,
+        store: BookingStore | None = None,
+    ) -> None:
         self._config = config
         self._client = client
         self._clock = clock
+        self._store = store
         self._used = False
         self._attempt_id = uuid.uuid4().hex
         log_bindings: dict[str, object] = {
@@ -304,6 +320,7 @@ class BookingAttempt:
                 # afterwards. Returning from inside the loop caused a race where a parallel
                 # `slot_taken` could beat an actual `won` response.
                 won_booking: BookingResponse | None = None
+                won_court_id: int | None = None
                 slot_taken_code: str | None = None
                 config_err_code: str | None = None
                 unknown_code: str | None = None
@@ -332,6 +349,9 @@ class BookingAttempt:
                         )
                         if won_booking is None:
                             won_booking = booking
+                            won_court_id = self._config.court_ids[
+                                idx % len(self._config.court_ids)
+                            ]
                         else:
                             duplicates.append(booking)
                         continue
@@ -391,6 +411,8 @@ class BookingAttempt:
                 # Phase 2: apply priority. Win beats all terminal errors (CR blocker).
                 if won_booking is not None:
                     await self._drain_for_duplicates(pending, duplicates)
+                    assert won_court_id is not None  # set together with won_booking
+                    await self._persist_win(won_booking, won_court_id, "window")
                     self._log.info(
                         "result",
                         status="won",
@@ -588,6 +610,34 @@ class BookingAttempt:
         # Drain cancellations so background coroutines don't leak past run() return.
         await asyncio.gather(*pending, return_exceptions=True)
         pending.clear()
+
+    async def _persist_win(
+        self,
+        booking: BookingResponse,
+        court_id: int,
+        phase: Literal["window", "poll"],
+    ) -> None:
+        if self._store is None:
+            return
+        try:
+            slot = BookedSlot(
+                schema_version=SCHEMA_VERSION,
+                record_id=booking.record_id,
+                record_hash=booking.record_hash,
+                slot_dt_local=self._config.slot_dt_local,
+                court_id=court_id,
+                service_id=self._config.service_id,
+                profile_name=self._config.profile_name,
+                phase=phase,
+                booked_at_utc=self._clock.now_utc(),
+            )
+            await self._store.append(slot)
+        except Exception:
+            # Persistence failure must not bubble into the attempt result —
+            # the booking on the server already exists. Log and continue.
+            self._log.exception(
+                "persistence_append_failed", record_id=booking.record_id
+            )
 
     async def _drain_for_duplicates(
         self,

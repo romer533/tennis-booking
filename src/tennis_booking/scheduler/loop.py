@@ -19,6 +19,7 @@ from tennis_booking.engine.attempt import (
     BookingAttempt,
 )
 from tennis_booking.engine.poll import PollAttempt, PollConfigData
+from tennis_booking.persistence import BookingStore
 from tennis_booking.scheduler.clock import CheckResult, check_ntp_drift
 from tennis_booking.scheduler.clock_errors import (
     ClockDriftError,
@@ -67,17 +68,30 @@ class ScheduledAttempt:
     window_open_utc: datetime
 
 
-AttemptFactory = Callable[[AttemptConfig, AltegioClient, Clock], BookingAttempt]
+AttemptFactory = Callable[
+    [AttemptConfig, AltegioClient, Clock, BookingStore | None], BookingAttempt
+]
 PollAttemptFactory = Callable[
-    [AttemptConfig, PollConfigData, AltegioClient, Clock, asyncio.Event], PollAttempt
+    [
+        AttemptConfig,
+        PollConfigData,
+        AltegioClient,
+        Clock,
+        asyncio.Event,
+        BookingStore | None,
+    ],
+    PollAttempt,
 ]
 NTPChecker = Callable[[], Awaitable[CheckResult]]
 
 
 def _default_attempt_factory(
-    config: AttemptConfig, client: AltegioClient, clock: Clock
+    config: AttemptConfig,
+    client: AltegioClient,
+    clock: Clock,
+    store: BookingStore | None,
 ) -> BookingAttempt:
-    return BookingAttempt(config, client, clock)
+    return BookingAttempt(config, client, clock, store=store)
 
 
 def _default_poll_attempt_factory(
@@ -86,8 +100,9 @@ def _default_poll_attempt_factory(
     client: AltegioClient,
     clock: Clock,
     won_event: asyncio.Event,
+    store: BookingStore | None,
 ) -> PollAttempt:
-    return PollAttempt(config, poll, client, clock, won_event=won_event)
+    return PollAttempt(config, poll, client, clock, won_event=won_event, store=store)
 
 
 def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
@@ -140,6 +155,7 @@ class SchedulerLoop:
         poll_attempt_factory: PollAttemptFactory | None = None,
         ntp_checker: NTPChecker | None = None,
         shutdown_timeout_s: float = SHUTDOWN_TIMEOUT_S,
+        store: BookingStore | None = None,
     ) -> None:
         self._config = config
         self._client = altegio_client
@@ -148,6 +164,7 @@ class SchedulerLoop:
         self._ntp_required = ntp_required
         self._ntp_threshold_ms = ntp_threshold_ms
         self._shutdown_timeout_s = shutdown_timeout_s
+        self._store = store
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
@@ -299,6 +316,22 @@ class SchedulerLoop:
                     now_utc=now_utc.isoformat(),
                 )
                 continue
+            if self._store is not None:
+                existing = await self._store.find(
+                    slot_dt_local=slot_dt_local,
+                    court_ids=list(booking.court_ids),
+                    service_id=booking.service_id,
+                    profile_name=booking.profile.name,
+                )
+                if existing is not None:
+                    self._log.info(
+                        "attempt_skipped_already_booked",
+                        booking_name=booking.name,
+                        slot_dt_local=slot_dt_local.isoformat(),
+                        record_id=existing.record_id,
+                        existing_phase=existing.phase,
+                    )
+                    continue
             result.append(
                 ScheduledAttempt(
                     booking=booking,
@@ -447,10 +480,27 @@ class SchedulerLoop:
                 log.info("attempt_skipped_sibling_won")
                 return
 
+            if self._store is not None:
+                existing = await self._store.find(
+                    slot_dt_local=scheduled.slot_dt_local,
+                    court_ids=list(booking.court_ids),
+                    service_id=booking.service_id,
+                    profile_name=booking.profile.name,
+                )
+                if existing is not None:
+                    log.info(
+                        "attempt_skipped_already_booked_at_prearm",
+                        record_id=existing.record_id,
+                        existing_phase=existing.phase,
+                    )
+                    return
+
             await self._pre_attempt_ntp_check(log)
 
             log.info("attempt_starting")
-            attempt = self._attempt_factory(attempt_cfg, self._client, self._clock)
+            attempt = self._attempt_factory(
+                attempt_cfg, self._client, self._clock, self._store
+            )
             try:
                 result: AttemptResult = await attempt.run(scheduled.window_open_utc)
             except asyncio.CancelledError:
@@ -532,9 +582,24 @@ class SchedulerLoop:
             if current_task is not None:
                 self._running.add(current_task)
 
+            if self._store is not None:
+                existing = await self._store.find(
+                    slot_dt_local=scheduled.slot_dt_local,
+                    court_ids=list(booking.court_ids),
+                    service_id=booking.service_id,
+                    profile_name=booking.profile.name,
+                )
+                if existing is not None:
+                    log.info(
+                        "poll_skipped_already_booked",
+                        record_id=existing.record_id,
+                        existing_phase=existing.phase,
+                    )
+                    return
+
             log.info("poll_starting")
             attempt = self._poll_attempt_factory(
-                attempt_cfg, poll_data, self._client, self._clock, won_event
+                attempt_cfg, poll_data, self._client, self._clock, won_event, self._store
             )
             try:
                 result: AttemptResult = await attempt.run()
@@ -638,6 +703,7 @@ class SchedulerLoop:
             service_id=booking.service_id,
             fullname=booking.profile.full_name,
             phone=booking.profile.phone,
+            profile_name=booking.profile.name,
             email=booking.profile.email,
         )
 

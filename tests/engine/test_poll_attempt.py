@@ -132,6 +132,7 @@ def _make_attempt_config(**overrides: Any) -> AttemptConfig:
         "service_id": SERVICE_ID,
         "fullname": "Roman",
         "phone": "77026473809",
+        "profile_name": "roman",
         "email": None,
     }
     defaults.update(overrides)

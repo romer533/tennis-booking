@@ -197,6 +197,7 @@ def attempt_config() -> Callable[..., AttemptConfig]:
             "service_id": SERVICE_ID,
             "fullname": "Roman",
             "phone": "77026473809",
+            "profile_name": "roman",
             "email": None,
             "parallel_shots": 2,
             "not_open_retry_ms": 100,

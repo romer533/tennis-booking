@@ -44,6 +44,7 @@ class TestAttemptConfigCourtIdsValidation:
                 service_id=1,
                 fullname="R",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_zero_court_id_in_tuple_rejected(self) -> None:
@@ -54,6 +55,7 @@ class TestAttemptConfigCourtIdsValidation:
                 service_id=1,
                 fullname="R",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_duplicate_court_ids_rejected(self) -> None:
@@ -64,6 +66,7 @@ class TestAttemptConfigCourtIdsValidation:
                 service_id=1,
                 fullname="R",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_list_instead_of_tuple_rejected(self) -> None:
@@ -74,6 +77,7 @@ class TestAttemptConfigCourtIdsValidation:
                 service_id=1,
                 fullname="R",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_naive_datetime_still_rejected_with_pool(self) -> None:
@@ -84,6 +88,7 @@ class TestAttemptConfigCourtIdsValidation:
                 service_id=1,
                 fullname="R",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_utc_datetime_still_rejected_with_pool(self) -> None:
@@ -94,6 +99,7 @@ class TestAttemptConfigCourtIdsValidation:
                 service_id=1,
                 fullname="R",
                 phone="77000",
+                profile_name="roman",
             )
 
 
@@ -108,6 +114,7 @@ class TestEffectiveShots:
             service_id=7849893,
             fullname="R",
             phone="77000",
+            profile_name="roman",
             parallel_shots=2,  # ignored for pool
         )
         assert cfg.effective_shots == 5
@@ -119,6 +126,7 @@ class TestEffectiveShots:
             service_id=7849893,
             fullname="R",
             phone="77000",
+            profile_name="roman",
             parallel_shots=2,
         )
         assert cfg.effective_shots == 2
@@ -130,6 +138,7 @@ class TestEffectiveShots:
             service_id=7849893,
             fullname="R",
             phone="77000",
+            profile_name="roman",
             parallel_shots=1,
         )
         assert cfg.effective_shots == 1
