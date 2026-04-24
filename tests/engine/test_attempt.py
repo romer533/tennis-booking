@@ -66,7 +66,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="timezone-aware"):
             AttemptConfig(
                 slot_dt_local=datetime(2026, 4, 26, 23, 0),
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -76,7 +76,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="Asia/Almaty"):
             AttemptConfig(
                 slot_dt_local=datetime(2026, 4, 26, 23, 0, tzinfo=UTC),
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -86,7 +86,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="fullname"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="   ",
                 phone="77000",
@@ -96,17 +96,17 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="phone"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone=" ",
             )
 
     def test_zero_court_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="court_id"):
+        with pytest.raises(ValueError, match="court_ids"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=0,
+                court_ids=(0,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -116,7 +116,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="service_id"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=-5,
                 fullname="Roman",
                 phone="77000",
@@ -126,7 +126,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="parallel_shots"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -137,7 +137,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="global_deadline_s"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -149,7 +149,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="global_deadline_s"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -161,7 +161,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="not_open_deadline_s"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -173,7 +173,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="not_open_retry_ms"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -184,7 +184,7 @@ class TestAttemptConfigValidation:
         with pytest.raises(ValueError, match="prearm_lead_s"):
             AttemptConfig(
                 slot_dt_local=SLOT,
-                court_id=1,
+                court_ids=(1,),
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
@@ -195,7 +195,7 @@ class TestAttemptConfigValidation:
         # Only empty-after-strip is rejected; non-empty with whitespace is fine (client strips).
         cfg = AttemptConfig(
             slot_dt_local=SLOT,
-            court_id=1,
+            court_ids=(1,),
             service_id=1,
             fullname=" Roman ",
             phone="77000",
@@ -205,7 +205,7 @@ class TestAttemptConfigValidation:
     def test_valid_config_accepts_defaults(self) -> None:
         cfg = AttemptConfig(
             slot_dt_local=SLOT,
-            court_id=1,
+            court_ids=(1,),
             service_id=1,
             fullname="Roman",
             phone="77000",

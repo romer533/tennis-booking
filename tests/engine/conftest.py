@@ -187,9 +187,13 @@ def fake_client() -> Callable[..., FakeAltegioClient]:
 @pytest.fixture
 def attempt_config() -> Callable[..., AttemptConfig]:
     def _make(**overrides: Any) -> AttemptConfig:
+        # `court_id=X` shortcut for legacy single-court tests; expanded to court_ids=(X,).
+        if "court_id" in overrides:
+            cid = overrides.pop("court_id")
+            overrides.setdefault("court_ids", (cid,))
         defaults: dict[str, Any] = {
             "slot_dt_local": SLOT,
-            "court_id": STAFF_ID,
+            "court_ids": (STAFF_ID,),
             "service_id": SERVICE_ID,
             "fullname": "Roman",
             "phone": "77026473809",

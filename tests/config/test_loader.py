@@ -51,7 +51,7 @@ class TestHappyPath:
         rb = cfg.bookings[0]
         assert rb.name == "Пятница вечер"
         assert rb.weekday == Weekday.FRIDAY
-        assert rb.court_id == 5
+        assert rb.court_ids == (5,)
         assert rb.service_id == 7849893
         assert rb.profile is cfg.profiles["roman"]
 

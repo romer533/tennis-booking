@@ -1,8 +1,9 @@
 from .errors import ConfigError
-from .loader import load_app_config, load_profiles, load_schedule
+from .loader import load_app_config, load_court_pools, load_profiles, load_schedule
 from .schema import (
     AppConfig,
     BookingRule,
+    CourtPool,
     Profile,
     ResolvedBooking,
     Weekday,
@@ -14,10 +15,12 @@ __all__ = [
     "AppConfig",
     "BookingRule",
     "ConfigError",
+    "CourtPool",
     "Profile",
     "ResolvedBooking",
     "Weekday",
     "load_app_config",
+    "load_court_pools",
     "load_profiles",
     "load_schedule",
     "mask_email",

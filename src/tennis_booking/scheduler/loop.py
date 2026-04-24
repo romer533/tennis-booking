@@ -79,14 +79,16 @@ def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
 def _scheduled_key(
     booking_name: str,
     slot_dt_local: datetime,
-    court_id: int,
+    court_ids: tuple[int, ...],
     service_id: int,
 ) -> tuple[str, str, int, int]:
     # Two BookingRule's can legally share a `name` (config loader dedupes by
     # (weekday, slot_time, court_id), not name) — for example "Вечер" on court 5
     # and "Вечер" on court 6 when the user wants either court. Keying only by
     # (name, slot) would silently drop one of them as a duplicate.
-    return (booking_name, slot_dt_local.isoformat(), court_id, service_id)
+    # `court_ids` is a tuple (immutable) → hashable; hash is deterministic for
+    # same tuple, so re-spawn after recompute keeps the same key.
+    return (booking_name, slot_dt_local.isoformat(), hash(court_ids), service_id)
 
 
 class SchedulerLoop:
@@ -269,7 +271,7 @@ class SchedulerLoop:
             key = _scheduled_key(
                 sa.booking.name,
                 sa.slot_dt_local,
-                sa.booking.court_id,
+                sa.booking.court_ids,
                 sa.booking.service_id,
             )
             existing = self._scheduled.get(key)
@@ -288,7 +290,8 @@ class SchedulerLoop:
             self._log.info(
                 "attempt_scheduled",
                 booking_name=sa.booking.name,
-                court_id=sa.booking.court_id,
+                court_ids=sa.booking.court_ids,
+                pool_name=sa.booking.pool_name,
                 slot_dt_local=sa.slot_dt_local.isoformat(),
                 window_open_utc=sa.window_open_utc.isoformat(),
             )
@@ -298,13 +301,14 @@ class SchedulerLoop:
         key = _scheduled_key(
             booking.name,
             scheduled.slot_dt_local,
-            booking.court_id,
+            booking.court_ids,
             booking.service_id,
         )
 
         log = self._log.bind(
             booking_name=booking.name,
-            court_id=booking.court_id,
+            court_ids=booking.court_ids,
+            pool_name=booking.pool_name,
             slot_dt_local=scheduled.slot_dt_local.isoformat(),
             window_open_utc=scheduled.window_open_utc.isoformat(),
         )
@@ -397,7 +401,7 @@ class SchedulerLoop:
         booking = scheduled.booking
         return AttemptConfig(
             slot_dt_local=scheduled.slot_dt_local,
-            court_id=booking.court_id,
+            court_ids=booking.court_ids,
             service_id=booking.service_id,
             fullname=booking.profile.full_name,
             phone=booking.profile.phone,

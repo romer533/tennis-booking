@@ -35,10 +35,16 @@ _PER_SHOT_MIN_TIMEOUT_S = 0.2
 
 @dataclass(frozen=True)
 class AttemptConfig:
-    """Параметры одной попытки бронирования. Immutable — reused между prearm/fire/retry."""
+    """Параметры одной попытки бронирования. Immutable — reused между prearm/fire/retry.
+
+    court_ids — один или несколько courts: engine fan-out'ит параллельные shots
+    на разные courts (по одному shot на court при len>1). Для legacy single-court
+    — tuple из одного элемента, shots дублируются на тот же court согласно
+    parallel_shots.
+    """
 
     slot_dt_local: datetime
-    court_id: int
+    court_ids: tuple[int, ...]
     service_id: int
     fullname: str
     phone: str
@@ -56,8 +62,23 @@ class AttemptConfig:
             raise ValueError(
                 f"slot_dt_local must be in Asia/Almaty, got {self.slot_dt_local.tzinfo}"
             )
-        if self.court_id < 1:
-            raise ValueError(f"court_id must be >= 1, got {self.court_id}")
+        if not isinstance(self.court_ids, tuple):
+            raise ValueError(
+                f"court_ids must be a tuple, got {type(self.court_ids).__name__}"
+            )
+        if not self.court_ids:
+            raise ValueError("court_ids must contain at least one id")
+        for cid in self.court_ids:
+            if not isinstance(cid, int) or isinstance(cid, bool):
+                raise ValueError(
+                    f"court_ids entries must be integers, got {type(cid).__name__}"
+                )
+            if cid < 1:
+                raise ValueError(f"court_ids entries must be >= 1, got {cid}")
+        if len(set(self.court_ids)) != len(self.court_ids):
+            raise ValueError(
+                f"court_ids must be unique, got duplicates in {list(self.court_ids)}"
+            )
         if self.service_id < 1:
             raise ValueError(f"service_id must be >= 1, got {self.service_id}")
         if not self.fullname.strip():
@@ -79,6 +100,18 @@ class AttemptConfig:
             )
         if self.prearm_lead_s <= 0:
             raise ValueError(f"prearm_lead_s must be > 0, got {self.prearm_lead_s}")
+
+    @property
+    def effective_shots(self) -> int:
+        """Эффективное число параллельных shots.
+
+        Для pool (len(court_ids) > 1) — равно числу courts (по одному shot на
+        court); `parallel_shots` silently ignored. Для legacy (len==1) —
+        `parallel_shots` (дублирование на один и тот же court).
+        """
+        if len(self.court_ids) > 1:
+            return len(self.court_ids)
+        return self.parallel_shots
 
 
 @dataclass(frozen=True)
@@ -113,12 +146,17 @@ class BookingAttempt:
         self._clock = clock
         self._used = False
         self._attempt_id = uuid.uuid4().hex
-        self._log = _logger.bind(
-            attempt_id=self._attempt_id,
-            slot_dt_local=config.slot_dt_local.isoformat(),
-            court_id=config.court_id,
-            dry_run=client.config.dry_run,
-        )
+        log_bindings: dict[str, object] = {
+            "attempt_id": self._attempt_id,
+            "slot_dt_local": config.slot_dt_local.isoformat(),
+            "dry_run": client.config.dry_run,
+        }
+        if len(config.court_ids) <= 7:
+            log_bindings["court_ids"] = tuple(config.court_ids)
+        else:
+            log_bindings["court_id_primary"] = config.court_ids[0]
+            log_bindings["court_count"] = len(config.court_ids)
+        self._log = _logger.bind(**log_bindings)
 
     async def run(self, window_open_utc: datetime) -> AttemptResult:
         if self._used:
@@ -219,7 +257,7 @@ class BookingAttempt:
         response_at_utc: datetime | None = None
         duplicates: list[BookingResponse] = []
 
-        for idx in range(self._config.parallel_shots):
+        for idx in range(self._config.effective_shots):
             task = self._spawn_shot(idx, deadline_at_mono)
             pending.add(task)
             task_idx[task] = idx
@@ -509,14 +547,19 @@ class BookingAttempt:
         now = self._clock.monotonic()
         remaining = deadline_at_mono - now
         timeout_s = self._per_shot_timeout(remaining)
-        task = asyncio.create_task(self._shot(idx, timeout_s), name=f"shot-{idx}")
-        self._log.info("shot_posted", idx=idx, timeout_s=timeout_s)
+        # idx % len(court_ids): pool fan-outs одного shot на каждый court; legacy
+        # (len==1) — все shots дублируются на единственный court.
+        court_id = self._config.court_ids[idx % len(self._config.court_ids)]
+        task = asyncio.create_task(
+            self._shot(idx, court_id, timeout_s), name=f"shot-{idx}-court-{court_id}"
+        )
+        self._log.info("shot_posted", idx=idx, court_id=court_id, timeout_s=timeout_s)
         return task
 
-    async def _shot(self, idx: int, timeout_s: float) -> BookingResponse:
+    async def _shot(self, idx: int, court_id: int, timeout_s: float) -> BookingResponse:
         return await self._client.create_booking(
             service_id=self._config.service_id,
-            staff_id=self._config.court_id,
+            staff_id=court_id,
             slot_dt_local=self._config.slot_dt_local,
             fullname=self._config.fullname,
             phone=self._config.phone,
