@@ -29,6 +29,7 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
     enabled: true
 """
@@ -50,6 +51,8 @@ class TestHappyPath:
         rb = cfg.bookings[0]
         assert rb.name == "Пятница вечер"
         assert rb.weekday == Weekday.FRIDAY
+        assert rb.court_id == 5
+        assert rb.service_id == 7849893
         assert rb.profile is cfg.profiles["roman"]
 
     def test_load_example_config_files(self, tmp_path: Path) -> None:
@@ -66,6 +69,25 @@ class TestHappyPath:
         # example schedule has court_id: 0 (placeholder) → must be rejected
         with pytest.raises(ConfigError, match="court_id"):
             load_app_config(tmp_path)
+
+    def test_example_schedule_with_court_id_filled_loads(self, tmp_path: Path) -> None:
+        # After Phase 0 the user replaces court_id: 0 → real id. Example service_id
+        # must already be valid so nothing else blocks loading.
+        repo_root = Path(__file__).resolve().parents[2]
+        cfg_dir = repo_root / "config"
+        (tmp_path / "profiles.yaml").write_text(
+            (cfg_dir / "profiles.example.yaml").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        schedule_text = (cfg_dir / "schedule.example.yaml").read_text(encoding="utf-8")
+        # Replace only the first court_id: 0 (enabled booking); disabled one still errors
+        # on its own court_id: 0, so replace both.
+        schedule_text = schedule_text.replace("court_id: 0", "court_id: 1521566")
+        (tmp_path / "schedule.yaml").write_text(schedule_text, encoding="utf-8")
+        cfg = load_app_config(tmp_path)
+        assert len(cfg.bookings) == 2
+        for rb in cfg.bookings:
+            assert rb.service_id == 7849893
 
     def test_two_profiles_two_bookings(self, tmp_path: Path) -> None:
         profiles = """\
@@ -85,12 +107,14 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
   - name: "sun"
     weekday: sunday
     slot_local_time: "09:00"
     duration_minutes: 90
     court_id: 6
+    service_id: 7849893
     profile: alex
 """
         write_config(tmp_path, profiles, schedule)
@@ -109,12 +133,14 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
   - name: "sun"
     weekday: sunday
     slot_local_time: "09:00"
     duration_minutes: 60
     court_id: 6
+    service_id: 7849893
     profile: roman
     enabled: false
 """
@@ -318,6 +344,18 @@ class TestValidationWrapping:
         with pytest.raises(ConfigError, match="court_id"):
             load_app_config(tmp_path)
 
+    def test_invalid_service_id_zero(self, tmp_path: Path) -> None:
+        bad = GOOD_SCHEDULE.replace("service_id: 7849893", "service_id: 0")
+        write_config(tmp_path, GOOD_PROFILES, bad)
+        with pytest.raises(ConfigError, match="service_id"):
+            load_app_config(tmp_path)
+
+    def test_missing_service_id(self, tmp_path: Path) -> None:
+        bad = GOOD_SCHEDULE.replace("    service_id: 7849893\n", "")
+        write_config(tmp_path, GOOD_PROFILES, bad)
+        with pytest.raises(ConfigError, match="service_id"):
+            load_app_config(tmp_path)
+
     def test_invalid_duration(self, tmp_path: Path) -> None:
         bad = GOOD_SCHEDULE.replace("duration_minutes: 60", "duration_minutes: 999")
         write_config(tmp_path, GOOD_PROFILES, bad)
@@ -416,12 +454,14 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
   - name: "second"
     weekday: friday
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
 """
         write_config(tmp_path, GOOD_PROFILES, schedule)
@@ -436,12 +476,14 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
   - name: "beta"
     weekday: friday
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
 """
         write_config(tmp_path, GOOD_PROFILES, schedule)
@@ -458,6 +500,7 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
     enabled: true
   - name: "second"
@@ -465,6 +508,7 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
     enabled: false
 """
@@ -480,12 +524,14 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
   - name: "court6"
     weekday: friday
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 6
+    service_id: 7849893
     profile: roman
 """
         write_config(tmp_path, GOOD_PROFILES, schedule)
@@ -500,12 +546,14 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
   - name: "sat"
     weekday: saturday
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 5
+    service_id: 7849893
     profile: roman
 """
         write_config(tmp_path, GOOD_PROFILES, schedule)
@@ -587,3 +635,4 @@ class TestLowLevelHelpers:
         result = load_schedule(tmp_path / "schedule.yaml")
         assert len(result) == 1
         assert result[0].profile == "roman"
+        assert result[0].service_id == 7849893

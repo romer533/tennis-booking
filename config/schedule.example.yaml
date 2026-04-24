@@ -1,5 +1,17 @@
 # Пример расписания. Скопируйте в config/schedule.yaml и отредактируйте.
 # Реальный config/schedule.yaml — в .gitignore.
+#
+# court_id — Altegio staff_id (в терминах Altegio каждый корт — "мастер").
+#   Как получить: см. docs/api-research.md (раздел "Корты / staff_id") или
+#   DevTools на b551098.alteg.io → Network → /api/v2/.../bookform/search/staff
+#   → поле "staff_id".
+#
+# service_id — id услуги ("Аренда открытого корта (1 час)" и т.п.).
+#   ОТЛИЧАЕТСЯ от staff_id: в Altegio services и staff — разные сущности.
+#   Как получить: docs/api-research.md (раздел "Services") или DevTools →
+#   /api/v2/.../bookform/services → поле "id". Для "Аренда открытого корта
+#   (1 час)" в клубе Daulet: 7849893.
+#   В теле POST /records/521176 попадает как "services": [<service_id>].
 
 bookings:
   - name: "Пятница вечер, парный"
@@ -7,6 +19,7 @@ bookings:
     slot_local_time: "18:00"
     duration_minutes: 60
     court_id: 0  # заполнить после Phase 0 (см. docs/api-research.md)
+    service_id: 7849893  # "Аренда открытого корта (1 час)"
     profile: roman
     enabled: true
 
@@ -15,5 +28,6 @@ bookings:
     slot_local_time: "09:00"
     duration_minutes: 60
     court_id: 0
+    service_id: 7849893
     profile: roman
     enabled: false

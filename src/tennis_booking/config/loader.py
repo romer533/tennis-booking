@@ -190,6 +190,7 @@ def _resolve(
                 slot_local_time=rule.slot_local_time,
                 duration_minutes=rule.duration_minutes,
                 court_id=rule.court_id,
+                service_id=rule.service_id,
                 profile=profiles[rule.profile],
                 enabled=rule.enabled,
             )
