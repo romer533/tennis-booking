@@ -1,0 +1,16 @@
+# /etc/sudoers.d/tennis-booking  (install with: visudo -f /etc/sudoers.d/tennis-booking)
+#
+# Lets the `whimpy` user run exactly the service-management commands needed by
+# the GitHub Actions deploy workflow — no password prompt, no shell escape.
+#
+# Permissions required:
+#   - restart         — apply new code
+#   - is-active       — health gate after restart
+#   - status / show   — diagnostic
+#   - journalctl      — tail recent lines on failure
+
+whimpy ALL=(root) NOPASSWD: /bin/systemctl restart tennis-booking, \
+                            /bin/systemctl is-active tennis-booking, \
+                            /bin/systemctl status tennis-booking, \
+                            /bin/systemctl show tennis-booking, \
+                            /bin/journalctl -u tennis-booking *

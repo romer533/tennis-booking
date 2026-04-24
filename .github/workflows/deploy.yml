@@ -1,0 +1,66 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Run only after CI is green. Using `needs:` across workflows requires a
+    # shared trigger — simplest path is relying on branch protection to gate
+    # `push: branches: [main]` itself. If you add required checks in the repo
+    # settings, set them on this workflow too so failed CI cannot deploy.
+    steps:
+      - name: Install SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$PORT" "$USER@$HOST" bash -s <<'EOF'
+          set -euo pipefail
+          cd /opt/tennis-booking
+          git fetch origin main
+          git reset --hard origin/main
+          ./venv/bin/pip install -e . --quiet
+          sudo systemctl restart tennis-booking
+          # Post-restart health gate. is-active retries briefly — service may be
+          # in `activating` state for a beat after restart.
+          for i in 1 2 3 4 5; do
+              if sudo systemctl is-active tennis-booking >/dev/null; then
+                  echo "service active after ${i}s"
+                  break
+              fi
+              sleep 1
+              if [ "$i" = "5" ]; then
+                  echo "ERROR: service not active after 5s"
+                  sudo systemctl status tennis-booking --no-pager || true
+                  echo "=== last 50 log lines ==="
+                  sudo journalctl -u tennis-booking -n 50 --no-pager || true
+                  exit 1
+              fi
+          done
+          echo "=== last 20 log lines ==="
+          sudo journalctl -u tennis-booking -n 20 --no-pager
+          EOF
+
+      - name: Report status
+        if: always()
+        run: echo "Deploy status: ${{ job.status }}"
