@@ -16,7 +16,7 @@ from tennis_booking.altegio import (
     TimeSlot,
 )
 from tennis_booking.altegio.client import AltegioClient
-from tennis_booking.engine.attempt import AttemptConfig
+from tennis_booking.engine.attempt import AttemptConfig, AttemptResult
 from tennis_booking.engine.poll import PollAttempt, PollConfigData
 
 from .conftest import (
@@ -304,9 +304,9 @@ async def test_poll_sets_won_event_on_win() -> None:
     assert won.is_set()
 
 
-async def test_poll_clears_won_event_on_fire_loss() -> None:
-    """If we set won_event before fire but lost (slot_taken or transport),
-    we must clear it so a still-live sibling can fire.
+async def test_poll_clears_won_event_on_business_fire_loss() -> None:
+    """On business-class loss (slot_taken with explicit code), we clear the
+    won_event so a still-live sibling can fire.
     """
     clock = _start_clock()
     won = asyncio.Event()
@@ -316,7 +316,9 @@ async def test_poll_clears_won_event_on_fire_loss() -> None:
             [_slot(SLOT, is_bookable=False)],
             [_slot(SLOT, is_bookable=False)],
         ],
-        booking_effects=[AltegioTransportError("ConnectError")],
+        booking_effects=[
+            AltegioBusinessError(code="slot_busy", message="taken", http_status=422),
+        ],
     )
     poll = PollAttempt(
         _make_attempt_config(),
@@ -326,23 +328,17 @@ async def test_poll_clears_won_event_on_fire_loss() -> None:
         won_event=won,
     )
 
-    # We expect this to keep polling. To stop the test, advance clock past slot.
     async def driver() -> Any:
         return await poll.run()
 
     task = asyncio.create_task(driver())
-    # let detect-fire-clear cycle run
     for _ in range(10):
         await asyncio.sleep(0)
-    # Check that after fire-loss, won_event was cleared (once we passed the lost path)
-    # Force completion by advancing clock past slot.
     clock.advance(3 * 24 * 3600)  # past slot
     result = await task
-    # transport_cause: slot_passed (we reached timeout)
     assert result.status == "timeout"
     assert result.transport_cause == "slot_passed"
-    # won_event should have been cleared at some point during the process.
-    # Final state: not set, since last action was clear → continue polling → timeout.
+    # Business-class loss → cleared, then later loop iteration → continues to timeout.
     assert not won.is_set()
 
 
@@ -615,14 +611,16 @@ async def test_search_unexpected_exception_continues_polling() -> None:
     assert result.status == "won"
 
 
-async def test_fire_all_transport_returns_lost_with_cause() -> None:
-    """All shots fail with transport — result is lost with transport_cause."""
+async def test_fire_all_transport_keeps_event_and_aborts_next_iteration() -> None:
+    """All shots fail with transport — result is lost with transport_cause.
+    won_event stays set (booking may have actually been created on the server),
+    so the next loop iteration self-aborts as won_by_sibling.
+    """
     clock = _start_clock()
     won = asyncio.Event()
     fake = FakePollClient(
         search_effects=[
             [_slot(SLOT, is_bookable=True, staff_id=5), _slot(SLOT, is_bookable=True, staff_id=6)],
-            [_slot(SLOT, is_bookable=False, staff_id=5), _slot(SLOT, is_bookable=False, staff_id=6)],
         ],
         booking_effects=[
             AltegioTransportError("ReadTimeout"),
@@ -637,18 +635,12 @@ async def test_fire_all_transport_returns_lost_with_cause() -> None:
         won_event=won,
     )
 
-    async def driver() -> Any:
-        return await poll.run()
-
-    task = asyncio.create_task(driver())
-    for _ in range(20):
-        await asyncio.sleep(0)
-    # Push past slot to terminate gracefully
-    clock.advance(3 * 24 * 3600)
-    result = await task
-    # First fire reset won_event after lost; then continued polling, slot_passed
-    assert result.status == "timeout"
-    assert not won.is_set()
+    result = await poll.run()
+    # After transport-loss the claim is kept; next iteration sees the event set
+    # and returns lost/won_by_sibling — preserving the safety invariant.
+    assert result.status == "lost"
+    assert result.business_code == "won_by_sibling"
+    assert won.is_set()
 
 
 async def test_fire_unknown_business_code_returns_lost_fallback() -> None:
@@ -716,3 +708,274 @@ async def test_search_call_uses_correct_date_and_staff_ids() -> None:
     call = fake.search_calls[0]
     assert call["date_local"] == SLOT.date()
     assert call["staff_ids"] == [5, 6]
+
+
+# ---- TestWonEventSafety: clear semantics around _fire_shots -----------------
+#
+# CR fix: won_event must be cleared ONLY on business-class loss with no
+# transport uncertainty. Transport / timeout loss leaves the event set so a
+# parallel window-sibling cannot fire a duplicate POST against a slot whose
+# real status is unknown (request reached the server, response was lost).
+
+
+def _patch_fire(poll: PollAttempt, result: AttemptResult) -> None:
+    """Replace `_fire_shots` with a stub returning a fixed `AttemptResult`."""
+
+    async def _stub(*, start_mono: float) -> AttemptResult:
+        return result
+
+    poll._fire_shots = _stub  # type: ignore[method-assign]  # noqa: SLF001
+
+
+async def test_clear_event_on_business_lost() -> None:
+    """status=lost with explicit business_code (slot_taken) → event cleared."""
+    clock = _start_clock()
+    won = asyncio.Event()
+    fake = FakePollClient(
+        search_effects=[
+            [_slot(SLOT, is_bookable=True)],
+            [_slot(SLOT, is_bookable=False)],
+        ],
+        booking_effects=[],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        won_event=won,
+    )
+    _patch_fire(
+        poll,
+        AttemptResult(
+            status="lost",
+            booking=None,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code="slot_taken",
+            transport_cause=None,
+            prearm_ok=False,
+            shots_fired=1,
+            attempt_id="x",
+            phase="poll",
+        ),
+    )
+
+    task = asyncio.create_task(poll.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # Drive past slot to terminate the loop.
+    clock.advance(3 * 24 * 3600)
+    await task
+    assert not won.is_set()
+
+
+async def test_no_clear_event_on_transport_lost() -> None:
+    """status=lost with transport_cause only → event stays set (duplicate guard)."""
+    clock = _start_clock()
+    won = asyncio.Event()
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        won_event=won,
+    )
+    _patch_fire(
+        poll,
+        AttemptResult(
+            status="lost",
+            booking=None,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code=None,
+            transport_cause="ReadTimeout",
+            prearm_ok=False,
+            shots_fired=1,
+            attempt_id="x",
+            phase="poll",
+        ),
+    )
+
+    result = await poll.run()
+    # After fire-loss the event is left set; next loop iteration self-aborts.
+    assert won.is_set()
+    assert result.status == "lost"
+    assert result.business_code == "won_by_sibling"
+
+
+async def test_no_clear_event_on_timeout() -> None:
+    """status=timeout (uncertainty class) → event stays set."""
+    clock = _start_clock()
+    won = asyncio.Event()
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        won_event=won,
+    )
+    _patch_fire(
+        poll,
+        AttemptResult(
+            status="timeout",
+            booking=None,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code=None,
+            transport_cause="ReadTimeout",
+            prearm_ok=False,
+            shots_fired=1,
+            attempt_id="x",
+            phase="poll",
+        ),
+    )
+
+    result = await poll.run()
+    assert won.is_set()
+    assert result.status == "lost"
+    assert result.business_code == "won_by_sibling"
+
+
+async def test_no_clear_event_on_error() -> None:
+    """status=error → poll returns error immediately; event stays set
+    (set just before fire), but it doesn't matter — sibling will see error
+    state via separate channel.
+    """
+    clock = _start_clock()
+    won = asyncio.Event()
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        won_event=won,
+    )
+    _patch_fire(
+        poll,
+        AttemptResult(
+            status="error",
+            booking=None,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code="unauthorized",
+            transport_cause=None,
+            prearm_ok=False,
+            shots_fired=0,
+            attempt_id="x",
+            phase="poll",
+        ),
+    )
+
+    result = await poll.run()
+    assert result.status == "error"
+    assert result.business_code == "unauthorized"
+    # Event was set right before fire and never cleared — poll exits before
+    # reaching the clear branch.
+    assert won.is_set()
+
+
+async def test_no_clear_event_on_won() -> None:
+    """Regression: status=won → event stays set (already was), poll returns won."""
+    clock = _start_clock()
+    won = asyncio.Event()
+    booking = BookingResponse(record_id=42, record_hash="h")
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        won_event=won,
+    )
+    _patch_fire(
+        poll,
+        AttemptResult(
+            status="won",
+            booking=booking,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code=None,
+            transport_cause=None,
+            prearm_ok=False,
+            shots_fired=1,
+            attempt_id="x",
+            phase="poll",
+        ),
+    )
+
+    result = await poll.run()
+    assert result.status == "won"
+    assert won.is_set()
+
+
+async def test_unknown_code_business_loss_clears_event() -> None:
+    """status=lost with arbitrary business_code (no transport_cause) → cleared.
+    The unknown-code fallback is still a server-side decision, not transport
+    uncertainty — safe to release the claim.
+    """
+    clock = _start_clock()
+    won = asyncio.Event()
+    fake = FakePollClient(
+        search_effects=[
+            [_slot(SLOT, is_bookable=True)],
+            [_slot(SLOT, is_bookable=False)],
+        ],
+        booking_effects=[],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        won_event=won,
+    )
+    _patch_fire(
+        poll,
+        AttemptResult(
+            status="lost",
+            booking=None,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code="random_unknown_code",
+            transport_cause=None,
+            prearm_ok=False,
+            shots_fired=1,
+            attempt_id="x",
+            phase="poll",
+        ),
+    )
+
+    task = asyncio.create_task(poll.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    clock.advance(3 * 24 * 3600)
+    await task
+    assert not won.is_set()

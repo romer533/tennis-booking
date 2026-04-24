@@ -223,8 +223,9 @@ class PollAttempt:
 
             self._log.info("poll_detected_bookable", matched_count=len(bookable))
 
-            # Claim fire exclusivity before POST. If we lose (slot_taken / transport),
-            # clear so that the window-sibling (if still live) can still fire.
+            # Claim fire exclusivity before POST. If we lose with an explicit
+            # business code (slot_taken / unknown_code fallback), clear so that
+            # the window-sibling (if still live) can still fire.
             self._won_event.set()
 
             result = await self._fire_shots(start_mono=start_mono)
@@ -234,14 +235,29 @@ class PollAttempt:
             if result.status == "error":
                 return result
 
-            # Not won — release the claim and continue polling.
-            self._won_event.clear()
-            self._log.info(
-                "poll_fire_miss_continuing",
-                status=result.status,
-                business_code=result.business_code,
-                transport_cause=result.transport_cause,
-            )
+            # Only clear on business-class loss with no transport uncertainty.
+            # Transport / timeout loss → request reached server, response lost:
+            # booking may have actually been created. Leaving the event set
+            # prevents the window-sibling from firing a duplicate POST.
+            if (
+                result.status == "lost"
+                and result.business_code is not None
+                and result.transport_cause is None
+            ):
+                self._won_event.clear()
+                self._log.info(
+                    "poll_fire_miss_continuing",
+                    status=result.status,
+                    business_code=result.business_code,
+                    transport_cause=result.transport_cause,
+                )
+            else:
+                self._log.info(
+                    "poll_fire_uncertain_keeping_claim",
+                    status=result.status,
+                    business_code=result.business_code,
+                    transport_cause=result.transport_cause,
+                )
             await self._sleep_interval()
 
     async def _sleep_interval(self) -> None:
