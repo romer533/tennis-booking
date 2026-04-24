@@ -14,13 +14,18 @@
 
 **Тестов в main:** 304 passed + 1 skipped + 1 deselected.
 
+## В работе (CR / CI)
+
+| Фаза | Ветка / PR | Статус |
+|------|------------|--------|
+| Phase 2 — `altegio/` | `feature/altegio-client` (cc90319) | CR в процессе. 98 тестов, 98% branch coverage. Будет PR #6 |
+
 ## Заблокировано
 
 | Что | Кем блокировано | Кто разблокирует |
 |-----|-----------------|------------------|
-| Phase 2 — `altegio/client.py` | Провокация #4 (cURL без antibot headers) → решение реверс JS vs headless Chromium | Пользователь |
-| Phase 3 — `scheduler/loop.py` | Phase 2 (нужен `client.prearm()`) | — |
-| Phase 4 — `engine/attempt.py` | Phase 2 | — |
+| Phase 3 — `scheduler/loop.py` | Phase 2 merge (нужен `AltegioClient.prearm()`) | — |
+| Phase 4 — `engine/attempt.py` | Phase 2 merge | — |
 | Phase 6 — observability | Phase 4 | — |
 | Phase 7 — deploy | Phase 6 | — |
 
@@ -30,7 +35,7 @@
 - [x] Hot path выявлен: единственный `POST /api/v1/book_record/521176`
 - [x] SMS / captcha — отсутствуют (Phase 1.5 отпадает)
 - [x] Город / TZ — Astana, `Asia/Almaty` (исправлено в коде PR #4)
-- [ ] **Провокация #4**: POST без `x-app-signature` / `x-app-client-context` — **главный блокер архитектуры**
+- [x] **Провокация #4**: POST без `x-app-signature` / `x-app-client-context` — **DONE**. Достаточно `Authorization: Bearer <static>`. Реверс JS / headless Chromium НЕ нужны.
 - [ ] Провокация #1: POST на слот через 4+ дней (закрытое окно — реакция API)
 - [ ] Провокация #2: POST на занятый слот (response shape)
 - [ ] Провокация #3: дубль POST с интервалом 50 мс (идемпотентность Altegio)
