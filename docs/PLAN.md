@@ -92,7 +92,7 @@
 **Цель:** компонент, который точно знает, *когда* нужно стрелять.
 
 **Что делать:**
-- `src/tennis_booking/scheduler/window.py`: чистая функция `next_open_window(slot_local_dt: datetime, now_utc: datetime) -> datetime` — возвращает UTC-время открытия окна (= slot_local_dt − 3 суток в Atyrau, в 07:00). Покрыть юнит-тестами на edge-cases (слоты на стыке суток).
+- `src/tennis_booking/scheduler/window.py`: чистая функция `next_open_window(slot_local_dt: datetime) -> datetime` — возвращает UTC-время открытия окна (= slot_local_dt − 3 суток в Atyrau, в 07:00). Не принимает `now_utc`: проверка "окно в будущем" — ответственность `loop.py`. Покрыть юнит-тестами на edge-cases (слоты на стыке суток).
 - `src/tennis_booking/scheduler/clock.py`: обёртка над часами с проверкой NTP-дрифта (через системный `chrony`/`w32tm` либо отдельный SNTP-запрос к `time.cloudflare.com` при старте). Отказ запускаться, если дрифт > 50 мс.
 - `src/tennis_booking/scheduler/loop.py`: главный цикл. Раз в сутки в 06:55 Atyrau пересчитывает все ближайшие окна на ближайшие 24 часа и регистрирует таски `asyncio.create_task` под каждое.
 - За **30 секунд** до окна — таск просыпается, поднимает соединения через `client.prearm()`.
