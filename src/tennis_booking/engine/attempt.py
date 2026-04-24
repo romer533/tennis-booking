@@ -251,14 +251,23 @@ class BookingAttempt:
                     # wait timed out → deadline reached next iteration
                     continue
 
+                # Phase 1: classify every task in `done` without returning from the loop.
+                # `done` can contain multiple tasks when responses arrive nearly together;
+                # iteration order of a set is non-deterministic, so we must classify all
+                # outcomes first and apply priority (win > slot_taken > config_err > ...)
+                # afterwards. Returning from inside the loop caused a race where a parallel
+                # `slot_taken` could beat an actual `won` response.
                 won_booking: BookingResponse | None = None
+                slot_taken_code: str | None = None
+                config_err_code: str | None = None
+                unknown_code: str | None = None
                 not_open_retry_idxs: list[int] = []
-                transport_retry_idxs: list[int] = []
                 not_open_code_seen: str | None = None
+                transport_retry_idxs: list[int] = []
                 transport_cause_seen: str | None = None
 
                 for task in done:
-                    idx = task_idx.pop(task, -1)
+                    idx = task_idx.pop(task)
                     if response_at_utc is None:
                         response_at_utc = self._clock.now_utc()
 
@@ -289,57 +298,20 @@ class BookingAttempt:
                             code=exc.code,
                             http_status=exc.http_status,
                         )
-                        if exc.code in CONFIG_ERROR_CODES:
-                            await self._cancel_all(pending)
-                            self._log.info("result", status="error", code=exc.code)
-                            return self._make_result(
-                                status="error",
-                                booking=None,
-                                duplicates=tuple(duplicates),
-                                fired_at_utc=fired_at_utc,
-                                response_at_utc=response_at_utc,
-                                start_mono=start_mono,
-                                business_code=exc.code,
-                                transport_cause=None,
-                                prearm_ok=prearm_ok,
-                                shots_fired=shots_fired,
-                            )
                         if exc.code in SLOT_TAKEN_CODES:
-                            await self._cancel_all(pending)
-                            self._log.info("result", status="lost", code=exc.code)
-                            return self._make_result(
-                                status="lost",
-                                booking=None,
-                                duplicates=tuple(duplicates),
-                                fired_at_utc=fired_at_utc,
-                                response_at_utc=response_at_utc,
-                                start_mono=start_mono,
-                                business_code=exc.code,
-                                transport_cause=None,
-                                prearm_ok=prearm_ok,
-                                shots_fired=shots_fired,
-                            )
-                        if exc.code in NOT_OPEN_CODES:
+                            if slot_taken_code is None:
+                                slot_taken_code = exc.code
+                        elif exc.code in CONFIG_ERROR_CODES:
+                            if config_err_code is None:
+                                config_err_code = exc.code
+                        elif exc.code in NOT_OPEN_CODES:
                             not_open_retry_idxs.append(idx)
-                            not_open_code_seen = exc.code
-                            continue
-                        # Unknown business code → fallback to lost per PO decision.
-                        await self._cancel_all(pending)
-                        self._log.info(
-                            "result", status="lost", code=exc.code, reason="unknown_code_fallback"
-                        )
-                        return self._make_result(
-                            status="lost",
-                            booking=None,
-                            duplicates=tuple(duplicates),
-                            fired_at_utc=fired_at_utc,
-                            response_at_utc=response_at_utc,
-                            start_mono=start_mono,
-                            business_code=exc.code,
-                            transport_cause=None,
-                            prearm_ok=prearm_ok,
-                            shots_fired=shots_fired,
-                        )
+                            if not_open_code_seen is None:
+                                not_open_code_seen = exc.code
+                        else:
+                            if unknown_code is None:
+                                unknown_code = exc.code
+                        continue
 
                     if isinstance(exc, AltegioTransportError):
                         self._log.info(
@@ -349,7 +321,13 @@ class BookingAttempt:
                             cause=exc.cause,
                         )
                         transport_retry_idxs.append(idx)
-                        transport_cause_seen = exc.cause
+                        if transport_cause_seen is None:
+                            transport_cause_seen = exc.cause
+                        continue
+
+                    if isinstance(exc, asyncio.CancelledError):
+                        # Self-cancel or external cancel racing with response — ignore.
+                        self._log.info("response_received", idx=idx, status="cancelled")
                         continue
 
                     # Any other exception — unexpected; treat as transport-class retry.
@@ -361,8 +339,10 @@ class BookingAttempt:
                         error=str(exc),
                     )
                     transport_retry_idxs.append(idx)
-                    transport_cause_seen = type(exc).__name__
+                    if transport_cause_seen is None:
+                        transport_cause_seen = type(exc).__name__
 
+                # Phase 2: apply priority. Win beats all terminal errors (CR blocker).
                 if won_booking is not None:
                     await self._drain_for_duplicates(pending, duplicates)
                     self._log.info(
@@ -384,34 +364,99 @@ class BookingAttempt:
                         shots_fired=shots_fired,
                     )
 
+                if slot_taken_code is not None:
+                    await self._cancel_all(pending)
+                    self._log.info("result", status="lost", code=slot_taken_code)
+                    return self._make_result(
+                        status="lost",
+                        booking=None,
+                        duplicates=tuple(duplicates),
+                        fired_at_utc=fired_at_utc,
+                        response_at_utc=response_at_utc,
+                        start_mono=start_mono,
+                        business_code=slot_taken_code,
+                        transport_cause=None,
+                        prearm_ok=prearm_ok,
+                        shots_fired=shots_fired,
+                    )
+
+                if config_err_code is not None:
+                    await self._cancel_all(pending)
+                    self._log.info("result", status="error", code=config_err_code)
+                    return self._make_result(
+                        status="error",
+                        booking=None,
+                        duplicates=tuple(duplicates),
+                        fired_at_utc=fired_at_utc,
+                        response_at_utc=response_at_utc,
+                        start_mono=start_mono,
+                        business_code=config_err_code,
+                        transport_cause=None,
+                        prearm_ok=prearm_ok,
+                        shots_fired=shots_fired,
+                    )
+
+                if unknown_code is not None:
+                    await self._cancel_all(pending)
+                    self._log.info(
+                        "result",
+                        status="lost",
+                        code=unknown_code,
+                        reason="unknown_code_fallback",
+                    )
+                    return self._make_result(
+                        status="lost",
+                        booking=None,
+                        duplicates=tuple(duplicates),
+                        fired_at_utc=fired_at_utc,
+                        response_at_utc=response_at_utc,
+                        start_mono=start_mono,
+                        business_code=unknown_code,
+                        transport_cause=None,
+                        prearm_ok=prearm_ok,
+                        shots_fired=shots_fired,
+                    )
+
+                # Not_open + transport retry. If not_open exhausted but transport is still
+                # live (global_deadline > not_open_deadline), drop not_open and keep
+                # transport retrying until global deadline.
                 if not_open_retry_idxs:
                     now_mono = self._clock.monotonic()
                     if now_mono > not_open_deadline_mono:
-                        await self._cancel_all(pending)
+                        if not transport_retry_idxs and not pending:
+                            await self._cancel_all(pending)
+                            self._log.info(
+                                "result",
+                                status="timeout",
+                                reason="not_open_deadline",
+                                code=not_open_code_seen,
+                            )
+                            return self._make_result(
+                                status="timeout",
+                                booking=None,
+                                duplicates=tuple(duplicates),
+                                fired_at_utc=fired_at_utc,
+                                response_at_utc=response_at_utc,
+                                start_mono=start_mono,
+                                business_code=not_open_code_seen,
+                                transport_cause=None,
+                                prearm_ok=prearm_ok,
+                                shots_fired=shots_fired,
+                            )
                         self._log.info(
-                            "result",
-                            status="timeout",
-                            reason="not_open_deadline",
+                            "not_open_dropped",
+                            reason="not_open_deadline_exceeded_but_transport_live",
                             code=not_open_code_seen,
                         )
-                        return self._make_result(
-                            status="timeout",
-                            booking=None,
-                            duplicates=tuple(duplicates),
-                            fired_at_utc=fired_at_utc,
-                            response_at_utc=response_at_utc,
-                            start_mono=start_mono,
-                            business_code=not_open_code_seen,
-                            transport_cause=None,
-                            prearm_ok=prearm_ok,
-                            shots_fired=shots_fired,
-                        )
-                    await self._clock.sleep(self._config.not_open_retry_ms / 1000.0)
-                    for idx in not_open_retry_idxs:
-                        task = self._spawn_shot(idx, deadline_at_mono)
-                        pending.add(task)
-                        task_idx[task] = idx
-                        shots_fired += 1
+                        not_open_retry_idxs = []
+                    else:
+                        await self._clock.sleep(self._config.not_open_retry_ms / 1000.0)
+
+                for idx in not_open_retry_idxs:
+                    task = self._spawn_shot(idx, deadline_at_mono)
+                    pending.add(task)
+                    task_idx[task] = idx
+                    shots_fired += 1
 
                 if transport_retry_idxs:
                     now_mono = self._clock.monotonic()
@@ -501,12 +546,15 @@ class BookingAttempt:
         """После win — cancel остальные, но собрать уже-готовые success как duplicates."""
         if not pending:
             return
-        # Cancel first to stop in-flight work.
-        for task in pending:
+        # Freeze iteration order: `pending` is a set, so we must materialise it before
+        # awaiting gather and zipping results, otherwise task/result correspondence is
+        # not guaranteed.
+        tasks_list = list(pending)
+        for task in tasks_list:
             if not task.done():
                 task.cancel()
-        results = await asyncio.gather(*pending, return_exceptions=True)
-        for task, res in zip(pending, results, strict=True):
+        results = await asyncio.gather(*tasks_list, return_exceptions=True)
+        for task, res in zip(tasks_list, results, strict=True):
             if task.cancelled():
                 continue
             if isinstance(res, BookingResponse):

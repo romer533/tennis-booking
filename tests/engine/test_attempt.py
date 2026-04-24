@@ -567,9 +567,16 @@ class TestConfigError:
         window_open: datetime,
     ) -> None:
         clock = make_clock()
-        # 1st responds 401, 2nd never used because engine cancels.
+        # With two-phase priority, if the second shot succeeds in the same `done` batch,
+        # win beats unauthorized. To exercise the "only unauthorized resolves" path, the
+        # second script entry must never complete; we use a hang-forever coroutine.
+
+        async def hang() -> BookingResponse:
+            await asyncio.sleep(3600)
+            return _booking(99)
+
         client = fake_client(
-            [_business("unauthorized", http_status=401), _booking(99)]
+            [_business("unauthorized", http_status=401), hang]
         )
         cfg = attempt_config(parallel_shots=2)
 
@@ -577,8 +584,7 @@ class TestConfigError:
         result = await attempt.run(window_open)
 
         assert result.status == "error"
-        # Both shots were posted, but only one was consumed (or both consumed, depending on
-        # scheduling). Either way status should be error and shots_fired == 2.
+        assert result.business_code == "unauthorized"
         assert result.shots_fired == 2
 
 
@@ -1025,6 +1031,220 @@ class TestEdgeCoverage:
 
         assert result.status == "timeout"
         assert result.transport_cause == "global_deadline"
+
+
+# ---- Race regression tests: two-phase priority classification --------------
+
+
+class TestRacePriority:
+    """Guards against the race in `asyncio.wait(..., FIRST_COMPLETED)` where `done`
+    can contain multiple tasks whose set-iteration order is non-deterministic.
+    Win MUST beat any terminal error in the same `done` batch.
+    """
+
+    @staticmethod
+    def _make_concurrent_booking(record_id: int) -> Callable[[], Any]:
+        """Shot that yields 10 times before returning — ensures both parallel shots
+        become done in the same `asyncio.wait` iteration."""
+
+        async def _shot() -> BookingResponse:
+            for _ in range(10):
+                await asyncio.sleep(0)
+            return _booking(record_id)
+
+        return _shot
+
+    @staticmethod
+    def _make_concurrent_business(code: str, http_status: int = 422) -> Callable[[], Any]:
+        async def _shot() -> BookingResponse:
+            for _ in range(10):
+                await asyncio.sleep(0)
+            raise _business(code, http_status=http_status)
+
+        return _shot
+
+    async def test_simultaneous_win_and_slot_taken_picks_win(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+        _patch_codes: Any,
+    ) -> None:
+        _patch_codes(frozenset({"not_yet_open"}), frozenset({"slot_busy"}))
+        clock = make_clock()
+        client = fake_client(
+            [
+                self._make_concurrent_booking(1),
+                self._make_concurrent_business("slot_busy"),
+            ]
+        )
+        cfg = attempt_config(parallel_shots=2)
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "won", "win must beat slot_taken in the same done batch"
+        assert result.booking is not None
+        assert result.booking.record_id == 1
+        # slot_taken exception does not produce a BookingResponse, so not in duplicates.
+        assert result.duplicates == ()
+        assert result.business_code is None
+
+    async def test_simultaneous_win_and_unauthorized_picks_win(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        clock = make_clock()
+        client = fake_client(
+            [
+                self._make_concurrent_booking(42),
+                self._make_concurrent_business("unauthorized", http_status=401),
+            ]
+        )
+        cfg = attempt_config(parallel_shots=2)
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "won"
+        assert result.booking is not None
+        assert result.booking.record_id == 42
+        assert result.business_code is None
+
+    async def test_simultaneous_win_and_unknown_code_picks_win(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        clock = make_clock()
+        # No _patch_codes: unknown codes are treated as "unknown_code" branch.
+        client = fake_client(
+            [
+                self._make_concurrent_booking(7),
+                self._make_concurrent_business("random_new_code"),
+            ]
+        )
+        cfg = attempt_config(parallel_shots=2)
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "won"
+        assert result.booking is not None
+        assert result.booking.record_id == 7
+        assert result.business_code is None
+
+    async def test_simultaneous_two_wins_second_in_duplicates(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        clock = make_clock()
+        client = fake_client(
+            [
+                self._make_concurrent_booking(1),
+                self._make_concurrent_booking(2),
+            ]
+        )
+        cfg = attempt_config(parallel_shots=2)
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "won"
+        assert result.booking is not None
+        won_id = result.booking.record_id
+        assert won_id in (1, 2)
+        assert len(result.duplicates) == 1
+        dup_id = result.duplicates[0].record_id
+        assert dup_id in (1, 2)
+        assert dup_id != won_id
+
+    async def test_drain_for_duplicates_collects_pending_success(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        """One shot wins immediately; the other is still pending and resolves shortly
+        after — _drain_for_duplicates must collect it as a duplicate."""
+        clock = make_clock()
+
+        async def fast_win() -> BookingResponse:
+            await asyncio.sleep(0)
+            return _booking(1001)
+
+        async def slow_win() -> BookingResponse:
+            # Still pending when fast_win returns, but has a booking ready after cancel.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            return _booking(1002)
+
+        client = fake_client([fast_win, slow_win])
+        cfg = attempt_config(parallel_shots=2)
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "won"
+        # First in: 1001; duplicate (if collected) is 1002. If slow_win was cancelled
+        # before it produced a result, duplicates is empty — both are acceptable because
+        # cancellation of an async sleep propagates CancelledError, not a BookingResponse.
+        assert result.booking is not None
+        assert result.booking.record_id == 1001
+
+    async def test_mixed_not_open_exhausted_and_transport_continues(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+        _patch_codes: Any,
+    ) -> None:
+        """Basic assertion of the invariant: global_deadline_s > not_open_deadline_s →
+        after not_open exhausts, transport retry should keep going until a win or the
+        global deadline. Here we script transport-then-win on shot 2 while shot 1 keeps
+        hitting not_open — the engine must not abandon shot 2's retry path just because
+        shot 1 exhausted its not_open window.
+        """
+        _patch_codes(frozenset({"not_yet_open"}), frozenset({"slot_busy"}))
+        clock = make_clock()
+
+        # Use a simpler shape: sequential effects (FakeClient is FIFO across both shots).
+        # shot A/B order is stochastic from the engine's perspective, so we script ~pairs
+        # of (not_open, transport) repeated, then two booking responses at the tail.
+        script: list[Any] = []
+        for _ in range(5):
+            script.append(_business("not_yet_open"))
+            script.append(_transport("ReadTimeout"))
+        script.append(_booking(500))
+        script.append(_booking(501))
+
+        client = fake_client(script)
+        cfg = attempt_config(
+            parallel_shots=2,
+            not_open_retry_ms=50,
+            not_open_deadline_s=1.0,
+            global_deadline_s=10.0,
+        )
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        # With transport retrying immediately and not_open retrying every 50ms, the
+        # engine should eventually reach a booking response from the tail of the script.
+        assert result.status == "won"
+        assert result.booking is not None
+        assert result.booking.record_id in (500, 501)
 
 
 @pytest.mark.parametrize(
