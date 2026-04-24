@@ -96,6 +96,7 @@ class BookingRule(BaseModel):
     slot_local_time: time
     duration_minutes: int = Field(ge=1, le=240)
     court_id: int = Field(ge=1)
+    service_id: int
     profile: str
     enabled: bool = True
 
@@ -127,6 +128,13 @@ class BookingRule(BaseModel):
     def _validate_slot_local_time(cls, v: Any) -> time:
         return _parse_slot_time(v)
 
+    @field_validator("service_id")
+    @classmethod
+    def _validate_service_id(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("service_id must be positive integer")
+        return v
+
     @field_validator("profile")
     @classmethod
     def _validate_profile_ref(cls, v: str) -> str:
@@ -145,6 +153,7 @@ class ResolvedBooking(BaseModel):
     slot_local_time: time
     duration_minutes: int
     court_id: int
+    service_id: int
     profile: Profile
     enabled: bool
 

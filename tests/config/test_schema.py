@@ -30,6 +30,7 @@ def make_booking(
     slot_local_time: str = "18:00",
     duration_minutes: int = 60,
     court_id: int = 5,
+    service_id: int = 7849893,
     profile: str = "roman",
     enabled: bool = True,
 ) -> BookingRule:
@@ -39,6 +40,7 @@ def make_booking(
         slot_local_time=slot_local_time,
         duration_minutes=duration_minutes,
         court_id=court_id,
+        service_id=service_id,
         profile=profile,
         enabled=enabled,
     )
@@ -158,6 +160,7 @@ class TestBookingRuleValid:
         assert b.slot_local_time == time(18, 0)
         assert b.duration_minutes == 60
         assert b.court_id == 5
+        assert b.service_id == 7849893
         assert b.profile == "roman"
         assert b.enabled is True
 
@@ -168,6 +171,7 @@ class TestBookingRuleValid:
             slot_local_time="07:00",
             duration_minutes=60,
             court_id=1,
+            service_id=7849893,
             profile="roman",
         )
         assert b.enabled is True
@@ -196,6 +200,11 @@ class TestBookingRuleValid:
         b = make_booking(court_id=c)
         assert b.court_id == c
 
+    @pytest.mark.parametrize("s", [1, 7849893, 9999999])
+    def test_valid_service_ids(self, s: int) -> None:
+        b = make_booking(service_id=s)
+        assert b.service_id == s
+
     @pytest.mark.parametrize(
         "weekday",
         [
@@ -219,6 +228,7 @@ class TestBookingRuleValid:
             slot_local_time="18:00",
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile="roman",
         )
         assert b.weekday == Weekday.FRIDAY
@@ -248,6 +258,34 @@ class TestBookingRuleInvalid:
         with pytest.raises(ValidationError):
             make_booking(court_id=c)
 
+    @pytest.mark.parametrize("s", [0, -1, -100])
+    def test_invalid_service_id(self, s: int) -> None:
+        with pytest.raises(ValidationError, match="service_id must be positive integer"):
+            make_booking(service_id=s)
+
+    def test_service_id_missing(self) -> None:
+        with pytest.raises(ValidationError, match="service_id"):
+            BookingRule(  # type: ignore[call-arg]
+                name="x",
+                weekday=Weekday.FRIDAY,
+                slot_local_time="18:00",
+                duration_minutes=60,
+                court_id=1,
+                profile="roman",
+            )
+
+    def test_service_id_string_rejected_strict(self) -> None:
+        with pytest.raises(ValidationError):
+            BookingRule(
+                name="x",
+                weekday=Weekday.FRIDAY,
+                slot_local_time="18:00",
+                duration_minutes=60,
+                court_id=1,
+                service_id="7849893",  # type: ignore[arg-type]
+                profile="roman",
+            )
+
     def test_invalid_weekday_string(self) -> None:
         with pytest.raises(ValidationError):
             BookingRule(
@@ -256,6 +294,7 @@ class TestBookingRuleInvalid:
                 slot_local_time="18:00",
                 duration_minutes=60,
                 court_id=1,
+                service_id=7849893,
                 profile="roman",
             )
 
@@ -267,6 +306,7 @@ class TestBookingRuleInvalid:
                 slot_local_time="18:00",
                 duration_minutes=60,
                 court_id=1,
+                service_id=7849893,
                 profile="roman",
             )
 
@@ -291,6 +331,7 @@ class TestBookingRuleInvalid:
                 slot_local_time=25200,  # type: ignore[arg-type]
                 duration_minutes=60,
                 court_id=1,
+                service_id=7849893,
                 profile="roman",
             )
 
@@ -302,6 +343,7 @@ class TestBookingRuleInvalid:
                 slot_local_time=time(7, 0),  # type: ignore[arg-type]
                 duration_minutes=60,
                 court_id=1,
+                service_id=7849893,
                 profile="roman",
             )
 
@@ -313,6 +355,7 @@ class TestBookingRuleInvalid:
                 slot_local_time="18:00",
                 duration_minutes=60,
                 court_id=1,
+                service_id=7849893,
                 profile="roman",
                 extra="hi",
             )
@@ -332,6 +375,7 @@ class TestResolvedBooking:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -345,6 +389,7 @@ class TestResolvedBooking:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -364,6 +409,7 @@ class TestResolvedBooking:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -377,6 +423,7 @@ class TestResolvedBooking:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -393,6 +440,7 @@ class TestAppConfig:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -411,6 +459,7 @@ class TestAppConfig:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -433,6 +482,7 @@ class TestAppConfig:
             slot_local_time=time(18, 0),
             duration_minutes=60,
             court_id=5,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -442,6 +492,7 @@ class TestAppConfig:
             slot_local_time=time(9, 0),
             duration_minutes=60,
             court_id=6,
+            service_id=7849893,
             profile=p,
             enabled=True,
         )
@@ -479,6 +530,7 @@ class TestWeekdayCoercion:
                 slot_local_time="18:00",
                 duration_minutes=60,
                 court_id=1,
+                service_id=7849893,
                 profile="roman",
             )
 

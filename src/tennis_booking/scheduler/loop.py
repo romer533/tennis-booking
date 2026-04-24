@@ -366,15 +366,10 @@ class SchedulerLoop:
 
     def _build_attempt_config(self, scheduled: ScheduledAttempt) -> AttemptConfig:
         booking = scheduled.booking
-        # service_id: in MVP the Altegio service is fixed per club. The booking config
-        # exposes only court_id; service is embedded in AltegioClient config? No — engine
-        # currently requires service_id explicitly. Phase 5 will add it to ResolvedBooking;
-        # for now mirror court_id (one-to-one in Daulet's setup per Phase 0).
-        service_id = booking.court_id
         return AttemptConfig(
             slot_dt_local=scheduled.slot_dt_local,
             court_id=booking.court_id,
-            service_id=service_id,
+            service_id=booking.service_id,
             fullname=booking.profile.full_name,
             phone=booking.profile.phone,
             email=booking.profile.email,

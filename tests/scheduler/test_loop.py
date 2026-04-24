@@ -50,6 +50,7 @@ def _booking(
     weekday: Weekday = Weekday.FRIDAY,
     slot_local_time: time = time(18, 0),
     court_id: int = STAFF_ID,
+    service_id: int = SERVICE_ID,
     profile: Profile | None = None,
     enabled: bool = True,
     duration_minutes: int = 60,
@@ -60,6 +61,7 @@ def _booking(
         slot_local_time=slot_local_time,
         duration_minutes=duration_minutes,
         court_id=court_id,
+        service_id=service_id,
         profile=profile or _profile(),
         enabled=enabled,
     )
@@ -562,7 +564,7 @@ class TestAttemptLaunch:
         clock = make_clock(initial_utc=now_utc)
         client = fake_client([])
         prof = Profile(name="alice", full_name="Alice A", phone="77777", email="a@x.com")
-        cfg = _config(_booking(name="b", court_id=1234, profile=prof))
+        cfg = _config(_booking(name="b", court_id=1234, service_id=4242, profile=prof))
         factory, created = fake_attempt_factory()
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory)
 
@@ -577,6 +579,7 @@ class TestAttemptLaunch:
         assert created
         ac: AttemptConfig = created[0].config
         assert ac.court_id == 1234
+        assert ac.service_id == 4242
         assert ac.fullname == "Alice A"
         assert ac.phone == "77777"
         assert ac.email == "a@x.com"
@@ -985,7 +988,7 @@ class TestAttemptConfigBuild:
         prof = Profile(
             name="bob", full_name="Bob B", phone="77002223344", email=None
         )
-        b = _booking(name="x", profile=prof, court_id=4242)
+        b = _booking(name="x", profile=prof, court_id=4242, service_id=9999)
         loop = _build_loop(_config(b), clock, client, ntp_checker=ok_ntp_checker)
         sa = (await loop._recompute_windows(clock.now_utc()))
         # If no scheduled (window past), build a synthetic ScheduledAttempt
@@ -999,6 +1002,7 @@ class TestAttemptConfigBuild:
             )]
         cfg_out = loop._build_attempt_config(sa[0])
         assert cfg_out.court_id == 4242
+        assert cfg_out.service_id == 9999
         assert cfg_out.fullname == "Bob B"
         assert cfg_out.phone == "77002223344"
         assert cfg_out.email is None
@@ -1022,7 +1026,14 @@ class TestIntegration:
             [BookingResponse(record_id=0, record_hash="dry-run")] * 4,
             dry_run=True,
         )
-        cfg = _config(_booking(weekday=Weekday.FRIDAY, slot_local_time=time(18, 0), court_id=SERVICE_ID))
+        cfg = _config(
+            _booking(
+                weekday=Weekday.FRIDAY,
+                slot_local_time=time(18, 0),
+                court_id=STAFF_ID,
+                service_id=SERVICE_ID,
+            )
+        )
 
         # No attempt_factory override → real BookingAttempt used.
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
