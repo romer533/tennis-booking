@@ -27,6 +27,7 @@ from tennis_booking.scheduler.window import next_open_window
 
 __all__ = [
     "DEFAULT_NTP_THRESHOLD_MS",
+    "LOOKAHEAD_WEEKS",
     "RECOMPUTE_LOCAL_TIME",
     "SHUTDOWN_TIMEOUT_S",
     "AttemptFactory",
@@ -38,6 +39,11 @@ __all__ = [
 RECOMPUTE_LOCAL_TIME = time(6, 55)
 DEFAULT_NTP_THRESHOLD_MS = 50
 SHUTDOWN_TIMEOUT_S = 60.0
+# Sanity bound: if the nearest weekly slot's window is already in the past,
+# walk forward week-by-week looking for the first occurrence whose window is
+# still open in the future. Anything beyond ~4 weeks indicates broken config,
+# not a normal "we just missed today's window" situation.
+LOOKAHEAD_WEEKS = 4
 
 _DAILY_INTERVAL_S = 24 * 60 * 60
 
@@ -219,16 +225,30 @@ class SchedulerLoop:
         for booking in self._config.bookings:
             if not booking.enabled:
                 continue
-            slot_dt_local = self._next_slot_occurrence(
+            nearest = self._next_slot_occurrence(
                 now_utc, booking.weekday, booking.slot_local_time
             )
-            window_open_utc = next_open_window(slot_dt_local)
-            if window_open_utc < now_utc:
+            slot_dt_local: datetime | None = None
+            window_open_utc: datetime | None = None
+            for week_offset in range(LOOKAHEAD_WEEKS):
+                candidate = nearest + timedelta(days=7 * week_offset)
+                candidate_window = next_open_window(candidate)
+                if candidate_window >= now_utc:
+                    slot_dt_local = candidate
+                    window_open_utc = candidate_window
+                    break
                 self._log.warning(
                     "window_passed",
                     booking_name=booking.name,
-                    slot_dt_local=slot_dt_local.isoformat(),
-                    window_open_utc=window_open_utc.isoformat(),
+                    slot_dt_local=candidate.isoformat(),
+                    window_open_utc=candidate_window.isoformat(),
+                    now_utc=now_utc.isoformat(),
+                )
+            if slot_dt_local is None or window_open_utc is None:
+                self._log.error(
+                    "no_future_window_found",
+                    booking_name=booking.name,
+                    weeks_searched=LOOKAHEAD_WEEKS,
                     now_utc=now_utc.isoformat(),
                 )
                 continue

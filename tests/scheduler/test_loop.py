@@ -21,6 +21,7 @@ from tennis_booking.engine.attempt import AttemptConfig, AttemptResult
 from tennis_booking.scheduler.clock_errors import ClockDriftError, NTPUnreachableError
 from tennis_booking.scheduler.loop import (
     DEFAULT_NTP_THRESHOLD_MS,
+    LOOKAHEAD_WEEKS,
     SchedulerLoop,
 )
 
@@ -372,14 +373,19 @@ class TestRecomputeLogic:
         make_clock: Callable[..., FakeClock],
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
-        # 07:30 Almaty Tuesday = 02:30 UTC. Friday 18:00 slot's window opened at
-        # Tuesday 07:00 → already 30 min ago → skip.
+        # 07:30 Almaty Tuesday = 02:30 UTC. Nearest Friday 18:00 slot's window opened
+        # at Tuesday 07:00 → already 30 min ago → that occurrence is skipped with
+        # window_passed warn, but the loop must roll forward to the *next* Friday
+        # (2026-05-01) whose window opens 2026-04-28 02:00 UTC — in the future.
         clock = make_clock(initial_utc=datetime(2026, 4, 21, 2, 30, 0, tzinfo=UTC))
         client = fake_client([])
         cfg = _config(_booking(name="fri", weekday=Weekday.FRIDAY, slot_local_time=time(18, 0)))
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
         scheduled = await loop._recompute_windows(clock.now_utc())
-        assert scheduled == []
+        assert len(scheduled) == 1
+        sa = scheduled[0]
+        assert sa.slot_dt_local == datetime(2026, 5, 1, 18, 0, tzinfo=ALMATY)
+        assert sa.window_open_utc == datetime(2026, 4, 28, 2, 0, tzinfo=UTC)
 
     async def test_friday_18_slot_recompute_tuesday_06_55(
         self,
@@ -1270,11 +1276,12 @@ class TestTightLoopAtExactRecompute:
         ok_ntp_checker: FakeNTPChecker,
         fake_attempt_factory: Callable[..., Any],
     ) -> None:
-        # 07:30 Almaty Tuesday = 02:30 UTC. The Friday-18:00 booking's window
-        # opens Tue 07:00 — already in the past. window_passed must filter it,
-        # so no task is spawned. The startup-immediate recompute must still run,
-        # and the next scheduled recompute must be tomorrow 06:55 (not today's
-        # already-passed 06:55 — that would be a tight loop).
+        # 07:30 Almaty Tuesday = 02:30 UTC. The nearest Friday-18:00 booking's
+        # window opens Tue 07:00 — already in the past. The loop must roll
+        # forward to next Friday (2026-05-01) whose window opens 2026-04-28
+        # 02:00 UTC — well in the future, so a task IS spawned (sleeping toward
+        # that prearm). Next scheduled recompute must still be tomorrow 06:55
+        # (not today's already-passed 06:55 — that would be a tight loop).
         now_utc = datetime(2026, 4, 21, 2, 30, 0, tzinfo=UTC)
         clock = make_clock(initial_utc=now_utc)
         client = fake_client([])
@@ -1289,15 +1296,18 @@ class TestTightLoopAtExactRecompute:
         run_task = asyncio.create_task(loop.run())
         for _ in range(10):
             await asyncio.sleep(0)
-        # Recompute ran, but the only window was already in the past → no task.
-        assert len(loop._scheduled) == 0
-        assert created == []
-        # Next recompute = tomorrow 06:55 (clock unchanged — no tasks sleeping).
-        assert clock.now_utc() == now_utc
-        next_at = loop._next_recompute_at(clock.now_utc())
-        target_local = next_at.astimezone(ALMATY)
-        assert target_local.hour == 6 and target_local.minute == 55
-        assert (target_local.date() - clock.now_utc().astimezone(ALMATY).date()).days == 1
+        # Recompute ran; nearest window was past, so loop rolled forward to
+        # next-week occurrence and spawned an attempt — the FakeClock auto-
+        # advances inside sleep(), so the task ran end-to-end. Exactly one
+        # FakeBookingAttempt must have been invoked (proving the schedule was
+        # for the future-week occurrence, not skipped). Before the fix this
+        # was always 0 because the only candidate was past and skipped.
+        assert len(created) == 1
+        # And the schedule fired for the next-week slot (2026-05-01 18:00 Almaty),
+        # not the nearest already-passed occurrence.
+        assert created[0].config.slot_dt_local == datetime(
+            2026, 5, 1, 18, 0, tzinfo=ALMATY
+        )
 
         await loop.stop()
         await run_task
@@ -1477,3 +1487,223 @@ class TestCourtPoolE2EViaLoop:
             "pool+legacy with different court_ids must be tracked as separate keys"
         )
         await loop.stop()
+
+
+# ---------- 13. Iterate to next weekly occurrence when nearest passed -------
+
+
+class _RecordingLogger:
+    """Drop-in for structlog BoundLogger that records every method call.
+
+    The loop only ever calls .info/.warning/.error/.exception/.bind on its logger.
+    `bind(...)` returns a child that shares the same `events` list, so kwargs
+    bound at call sites are merged into the recorded event for assertion.
+    """
+
+    def __init__(
+        self,
+        events: list[tuple[str, str, dict[str, Any]]] | None = None,
+        bound: dict[str, Any] | None = None,
+    ) -> None:
+        self.events: list[tuple[str, str, dict[str, Any]]] = (
+            events if events is not None else []
+        )
+        self._bound: dict[str, Any] = dict(bound or {})
+
+    def bind(self, **kwargs: Any) -> _RecordingLogger:
+        merged = {**self._bound, **kwargs}
+        return _RecordingLogger(events=self.events, bound=merged)
+
+    def _record(self, level: str, event: str, **kwargs: Any) -> None:
+        merged = {**self._bound, **kwargs}
+        self.events.append((level, event, merged))
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self._record("info", event, **kwargs)
+
+    def warning(self, event: str, **kwargs: Any) -> None:
+        self._record("warning", event, **kwargs)
+
+    def error(self, event: str, **kwargs: Any) -> None:
+        self._record("error", event, **kwargs)
+
+    def exception(self, event: str, **kwargs: Any) -> None:
+        self._record("error", event, **kwargs)
+
+    def by_event(self, event: str) -> list[dict[str, Any]]:
+        return [kw for _lvl, ev, kw in self.events if ev == event]
+
+
+class TestWindowPassedSkipsToNextWeek:
+    async def test_nearest_occurrence_window_already_passed_skips_to_next_week(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+    ) -> None:
+        # Reproduces the prod incident:
+        # weekday=sunday, slot_local_time="23:00" Almaty.
+        # Service started 2026-04-24 19:17 UTC (Friday evening).
+        # Nearest Sunday = 2026-04-26 23:00 Almaty → window opens 2026-04-23
+        # 07:00 Almaty = 2026-04-23 02:00 UTC → ALREADY PAST (yesterday).
+        # The loop must roll forward to the next Sunday (2026-05-03 23:00 Almaty)
+        # whose window opens 2026-04-30 02:00 UTC.
+        now_utc = datetime(2026, 4, 24, 19, 17, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config(
+            _booking(
+                name="sun-night",
+                weekday=Weekday.SUNDAY,
+                slot_local_time=time(23, 0),
+            )
+        )
+        loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
+        recorder = _RecordingLogger()
+        loop._log = recorder  # type: ignore[assignment]
+
+        scheduled = await loop._recompute_windows(now_utc)
+        assert len(scheduled) == 1
+        sa = scheduled[0]
+        assert sa.slot_dt_local == datetime(2026, 5, 3, 23, 0, tzinfo=ALMATY)
+        assert sa.window_open_utc == datetime(2026, 4, 30, 2, 0, tzinfo=UTC)
+
+        # window_passed must have been logged exactly once for the skipped
+        # nearest occurrence, and recompute_done must report scheduled=1.
+        passed = recorder.by_event("window_passed")
+        assert len(passed) == 1
+        assert passed[0]["booking_name"] == "sun-night"
+        assert passed[0]["slot_dt_local"] == (
+            datetime(2026, 4, 26, 23, 0, tzinfo=ALMATY).isoformat()
+        )
+
+        done = recorder.by_event("recompute_done")
+        assert done and done[-1]["scheduled"] == 1
+
+        # No sanity-error must fire on a healthy config.
+        assert recorder.by_event("no_future_window_found") == []
+
+    async def test_nearest_occurrence_window_in_future_uses_nearest(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+    ) -> None:
+        # 2026-04-20 00:00 UTC = 05:00 Almaty Monday. Nearest Sunday 23:00 slot
+        # = 2026-04-26 23:00 Almaty → window opens 2026-04-23 07:00 Almaty
+        # = 2026-04-23 02:00 UTC → still in the future. Use the nearest occurrence.
+        now_utc = datetime(2026, 4, 20, 0, 0, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config(
+            _booking(
+                name="sun-night",
+                weekday=Weekday.SUNDAY,
+                slot_local_time=time(23, 0),
+            )
+        )
+        loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
+        recorder = _RecordingLogger()
+        loop._log = recorder  # type: ignore[assignment]
+
+        scheduled = await loop._recompute_windows(now_utc)
+        assert len(scheduled) == 1
+        sa = scheduled[0]
+        assert sa.slot_dt_local == datetime(2026, 4, 26, 23, 0, tzinfo=ALMATY)
+        assert sa.window_open_utc == datetime(2026, 4, 23, 2, 0, tzinfo=UTC)
+        # No window_passed warns when nearest occurrence is already valid.
+        assert recorder.by_event("window_passed") == []
+
+    async def test_all_occurrences_past_within_lookahead_logs_error(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Sanity guard: if next_open_window keeps returning past values for every
+        # candidate within LOOKAHEAD_WEEKS (impossible for a healthy config,
+        # but defensive), the loop must log no_future_window_found and skip
+        # the booking — never hang, never schedule a stale window.
+        now_utc = datetime(2026, 4, 24, 19, 17, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config(
+            _booking(
+                name="sun-night",
+                weekday=Weekday.SUNDAY,
+                slot_local_time=time(23, 0),
+            )
+        )
+        loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
+        recorder = _RecordingLogger()
+        loop._log = recorder  # type: ignore[assignment]
+
+        from tennis_booking.scheduler import loop as loop_module
+
+        # Always return a past timestamp regardless of input.
+        past_utc = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        monkeypatch.setattr(loop_module, "next_open_window", lambda _slot: past_utc)
+
+        scheduled = await loop._recompute_windows(now_utc)
+        assert scheduled == []
+
+        # window_passed must be warned once per checked week, then a single
+        # no_future_window_found error.
+        passed = recorder.by_event("window_passed")
+        assert len(passed) == LOOKAHEAD_WEEKS
+        errors = recorder.by_event("no_future_window_found")
+        assert len(errors) == 1
+        assert errors[0]["booking_name"] == "sun-night"
+        assert errors[0]["weeks_searched"] == LOOKAHEAD_WEEKS
+
+        done = recorder.by_event("recompute_done")
+        assert done and done[-1]["scheduled"] == 0
+
+    async def test_multiple_window_passed_warns_before_scheduling(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Force the first two candidate windows past, the third in the future.
+        # Expected: two window_passed warns, then a successful schedule.
+        now_utc = datetime(2026, 4, 24, 19, 17, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config(
+            _booking(
+                name="sun-night",
+                weekday=Weekday.SUNDAY,
+                slot_local_time=time(23, 0),
+            )
+        )
+        loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
+        recorder = _RecordingLogger()
+        loop._log = recorder  # type: ignore[assignment]
+
+        from tennis_booking.scheduler import loop as loop_module
+
+        past_utc = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        future_utc = datetime(2030, 1, 1, 0, 0, 0, tzinfo=UTC)
+        call_count = {"n": 0}
+
+        def fake_window(_slot: datetime) -> datetime:
+            call_count["n"] += 1
+            return past_utc if call_count["n"] <= 2 else future_utc
+
+        monkeypatch.setattr(loop_module, "next_open_window", fake_window)
+
+        scheduled = await loop._recompute_windows(now_utc)
+        assert len(scheduled) == 1
+        assert scheduled[0].window_open_utc == future_utc
+
+        # Exactly two skipped occurrences logged before success.
+        assert len(recorder.by_event("window_passed")) == 2
+        assert recorder.by_event("no_future_window_found") == []
+
+    def test_lookahead_weeks_constant(self) -> None:
+        # Guard against accidental tuning. Bumping LOOKAHEAD_WEEKS should be
+        # an explicit decision (and require updating this test).
+        assert LOOKAHEAD_WEEKS == 4
