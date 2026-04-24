@@ -6,16 +6,18 @@ import re
 from datetime import datetime
 from types import TracebackType
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import ValidationError
+
+from tennis_booking.common.tz import ALMATY
 
 from .config import AltegioConfig
 from .errors import AltegioBusinessError, AltegioTransportError
 from .models import BookingAppointment, BookingRequest, BookingResponse
 
-ALMATY = ZoneInfo("Asia/Almaty")
+__all__ = ["ALMATY", "BOOK_RECORD_PATH", "AltegioClient"]
+
 BOOK_RECORD_PATH = "/api/v1/book_record/{company_id}"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=2.0)
@@ -25,8 +27,18 @@ _MAX_ERROR_BODY_CHARS = 500
 
 _logger = logging.getLogger(__name__)
 
-# Global filter on the httpx logger — strips Bearer tokens from formatted records.
+# Global filter on httpx + httpcore loggers — strips Bearer tokens from formatted records.
+# httpcore вызывает trace-logging на уровне raw bytes (HTTPCORE_LOG_LEVEL=trace) — там тоже может всплыть header.
 _BEARER_RE = re.compile(r"(Bearer\s+)([^\s'\"]+)", re.IGNORECASE)
+
+_REDACT_LOGGER_NAMES = (
+    "httpx",
+    "httpcore",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.connection",
+    "httpcore.proxy",
+)
 
 
 class _BearerRedactFilter(logging.Filter):
@@ -43,12 +55,12 @@ class _BearerRedactFilter(logging.Filter):
 
 
 def _install_bearer_filter() -> None:
-    httpx_logger = logging.getLogger("httpx")
-    # Install once — repeated ctor calls must not accumulate filters.
-    for f in httpx_logger.filters:
-        if isinstance(f, _BearerRedactFilter):
-            return
-    httpx_logger.addFilter(_BearerRedactFilter())
+    for name in _REDACT_LOGGER_NAMES:
+        logger = logging.getLogger(name)
+        # Install once per logger — repeated ctor calls must not accumulate filters.
+        if any(isinstance(f, _BearerRedactFilter) for f in logger.filters):
+            continue
+        logger.addFilter(_BearerRedactFilter())
 
 
 _install_bearer_filter()
@@ -103,6 +115,9 @@ class AltegioClient:
                 http2=True,
             )
         except ImportError:
+            _logger.warning(
+                "h2 package not installed, HTTP/2 unavailable, falling back to HTTP/1.1"
+            )
             return httpx.AsyncClient(
                 base_url=self._config.base_url,
                 timeout=_DEFAULT_TIMEOUT,
@@ -205,7 +220,7 @@ class AltegioClient:
     ) -> None:
         if slot_dt_local.tzinfo is None:
             raise ValueError("slot_dt_local must be timezone-aware")
-        if slot_dt_local.tzinfo is not ALMATY:
+        if slot_dt_local.tzinfo != ALMATY:
             raise ValueError(
                 f"slot_dt_local must be in Asia/Almaty, got {slot_dt_local.tzinfo}"
             )

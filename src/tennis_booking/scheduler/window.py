@@ -1,9 +1,11 @@
 from datetime import UTC, datetime, time, timedelta
-from zoneinfo import ZoneInfo
 
-ALMATY = ZoneInfo("Asia/Almaty")
+from tennis_booking.common.tz import ALMATY
+
 OPEN_LOCAL_TIME = time(7, 0, 0)
 LEAD_DAYS = 3
+
+__all__ = ["ALMATY", "LEAD_DAYS", "OPEN_LOCAL_TIME", "next_open_window"]
 
 
 def next_open_window(slot_local_dt: datetime) -> datetime:

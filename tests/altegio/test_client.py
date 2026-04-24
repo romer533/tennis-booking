@@ -255,6 +255,8 @@ async def test_negative_staff_id_rejected() -> None:
 
 @respx.mock
 async def test_4xx_with_meta_errors_business_error() -> None:
+    # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
+    # Current shape {"meta":{"errors":[...]}} is hypothetical, based on general Altegio API conventions.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             422,
@@ -284,6 +286,8 @@ async def test_4xx_with_meta_errors_business_error() -> None:
 
 @respx.mock
 async def test_4xx_with_meta_message_only() -> None:
+    # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
+    # Current shape {"meta":{"message":...},"success":false} is hypothetical, based on general Altegio API conventions.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             400,
@@ -307,6 +311,8 @@ async def test_4xx_with_meta_message_only() -> None:
 
 @respx.mock
 async def test_4xx_empty_body_unknown_code() -> None:
+    # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
+    # Empty-body 4xx is a hypothetical fallback path; real Altegio errors may always carry a body.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             400, content=b"", headers={"content-type": "application/json"}
@@ -329,6 +335,8 @@ async def test_4xx_empty_body_unknown_code() -> None:
 @respx.mock
 async def test_4xx_html_body_business_error() -> None:
     """Чёткое решение: 4xx HTML — серверная классификация ошибки → Business, не Transport."""
+    # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
+    # 4xx with HTML body is a hypothetical edge case (e.g., upstream proxy/WAF); real Altegio shape unconfirmed.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             403,
@@ -352,6 +360,8 @@ async def test_4xx_html_body_business_error() -> None:
 
 @respx.mock
 async def test_401_classified_as_unauthorized() -> None:
+    # TODO(provocation #3): verify actual Altegio 401 shape after manual provocation
+    # (e.g., expired/invalid Bearer token). Empty-body 401 is the hypothetical worst case.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             401, content=b"", headers={"content-type": "application/json"}
@@ -373,6 +383,8 @@ async def test_401_classified_as_unauthorized() -> None:
 @respx.mock
 async def test_401_with_explicit_code_kept() -> None:
     """Если сервер прислал свой code на 401 — его и используем (не перетираем 'unauthorized')."""
+    # TODO(provocation #3): verify actual Altegio 401 shape after manual provocation.
+    # The "token_expired" code is hypothetical, based on general Altegio API conventions.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             401,
@@ -682,6 +694,28 @@ async def test_bearer_not_in_caplog(caplog: pytest.LogCaptureFixture) -> None:
         assert BEARER not in msg, f"bearer leaked into log: {msg!r}"
 
 
+def test_bearer_not_in_caplog_httpcore(caplog: pytest.LogCaptureFixture) -> None:
+    """httpcore.* loggers тоже должны быть зачищены (TRACE-уровень логирует raw bytes с Authorization)."""
+    from tennis_booking.altegio.client import _BearerRedactFilter
+
+    # Эмулируем сценарий: httpcore.http11 логирует строку с Bearer на уровне DEBUG.
+    # Filter, повешенный на этот logger при импорте client, должен подменить токен.
+    httpcore_logger = logging.getLogger("httpcore.http11")
+    assert any(isinstance(f, _BearerRedactFilter) for f in httpcore_logger.filters), (
+        "_BearerRedactFilter must be installed on httpcore.http11"
+    )
+
+    caplog.set_level(logging.DEBUG, logger="httpcore.http11")
+    httpcore_logger.debug(
+        "send_request_headers.complete return_value=[(b'Authorization', b'Bearer %s')]",
+        BEARER,
+    )
+
+    for record in caplog.records:
+        msg = record.getMessage()
+        assert BEARER not in msg, f"bearer leaked into httpcore log: {msg!r}"
+
+
 def test_repr_does_not_contain_bearer() -> None:
     client = AltegioClient(_make_config())
     assert BEARER not in repr(client)
@@ -827,6 +861,8 @@ async def test_2xx_top_level_string_malformed() -> None:
 @respx.mock
 async def test_4xx_invalid_json_falls_back_to_text() -> None:
     """JSON content-type, но body не валидный JSON — fallback в truncated raw text."""
+    # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
+    # JSON content-type with non-JSON body is a hypothetical defensive case; real Altegio body shape unconfirmed.
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
             422,
@@ -849,6 +885,8 @@ async def test_4xx_invalid_json_falls_back_to_text() -> None:
 
 @respx.mock
 async def test_4xx_long_html_truncated() -> None:
+    # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
+    # Large HTML 4xx body is a hypothetical defensive case (e.g., upstream WAF page); real Altegio shape unconfirmed.
     long_body = b"X" * 1500
     respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
         return_value=httpx.Response(
