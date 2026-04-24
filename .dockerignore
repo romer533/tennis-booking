@@ -1,0 +1,48 @@
+# Keep the build context small — only `pyproject.toml`, `README.md`, and `src/`
+# actually land in the image. Everything else is either irrelevant or a secret.
+
+# VCS / CI
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Local virtualenvs / caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[codz]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Tests, docs, deploy artifacts — not needed at runtime
+tests/
+docs/
+deploy/
+
+# Configs with secrets / PII (read-only mount supplies these on the server)
+config/profiles.yaml
+config/schedule.yaml
+.env
+.env.*
+
+# Captured HTTP traces (api-research)
+*.har
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker meta
+Dockerfile
+.dockerignore

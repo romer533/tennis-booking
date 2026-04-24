@@ -1,19 +1,26 @@
 # /etc/sudoers.d/tennis-booking  (install with: visudo -f /etc/sudoers.d/tennis-booking)
 #
-# Lets the `whimpy` user run exactly the service-management commands needed by
-# the GitHub Actions deploy workflow — no password prompt, no shell escape.
+# Lets the `whimpy` user run exactly the commands the GitHub Actions deploy
+# workflow needs — no password prompt, no shell escape.
 #
 # Permissions required:
-#   - restart         — apply new code
-#   - is-active       — health gate after restart
-#   - status / show   — diagnostic
-#   - journalctl      — tail recent lines on failure
+#   - docker pull       — fetch the new image from ghcr.io
+#   - systemctl restart — apply the new image
+#   - systemctl is-active / status — health gate
+#   - journalctl        — tail recent lines on failure
 #
 # Both /bin and /usr/bin paths are listed for cross-distro portability. Most
 # modern distros symlink /bin → /usr/bin (Debian/Ubuntu since usrmerge,
 # Fedora/RHEL ≥ 7, Arch), but older RHEL, Alpine, and some custom images keep
 # them separate. sudo matches by absolute path post-resolution, so a single
 # /bin/... entry would silently fall through to a password prompt on those.
+#
+# Tag-glob `:*` allows pulling :latest, :sha-<short>, or any future tag without
+# editing sudoers per release. It does NOT allow pulling unrelated images —
+# the repository prefix is fixed.
+
+Cmnd_Alias TB_DOCKER = /bin/docker pull ghcr.io/romer533/tennis-booking\:*, \
+                       /usr/bin/docker pull ghcr.io/romer533/tennis-booking\:*
 
 Cmnd_Alias TB_SYSTEMCTL = /bin/systemctl restart tennis-booking, \
                           /usr/bin/systemctl restart tennis-booking, \
@@ -27,4 +34,4 @@ Cmnd_Alias TB_SYSTEMCTL = /bin/systemctl restart tennis-booking, \
 Cmnd_Alias TB_JOURNALCTL = /bin/journalctl -u tennis-booking *, \
                            /usr/bin/journalctl -u tennis-booking *
 
-whimpy ALL=(root) NOPASSWD: TB_SYSTEMCTL, TB_JOURNALCTL
+whimpy ALL=(root) NOPASSWD: TB_DOCKER, TB_SYSTEMCTL, TB_JOURNALCTL
