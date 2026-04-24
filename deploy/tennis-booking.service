@@ -1,0 +1,44 @@
+[Unit]
+Description=Tennis booking automation (Altegio)
+Documentation=https://github.com/RomanGoltsov/tennis-booking
+After=network-online.target chronyd.service
+Wants=network-online.target chronyd.service
+
+[Service]
+Type=simple
+User=whimpy
+Group=whimpy
+WorkingDirectory=/opt/tennis-booking
+EnvironmentFile=/etc/tennis-booking/env
+ExecStart=/opt/tennis-booking/venv/bin/python -m tennis_booking --config-dir=/etc/tennis-booking
+Restart=always
+RestartSec=5
+# Must be >= scheduler SHUTDOWN_TIMEOUT_S (60s) + buffer; losing an in-flight
+# booking attempt mid-fire is worse than a slow restart.
+TimeoutStopSec=70
+KillSignal=SIGTERM
+
+# Security hardening — service only needs to read config, write logs, talk HTTPS.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/tennis-booking
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+
+# stdout/stderr → systemd journal (StandardOutput=journal is the default, explicit
+# here for clarity). Python also writes to /var/log/tennis-booking/service.log via
+# RotatingFileHandler — the two sinks are complementary, not redundant.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tennis-booking
+
+[Install]
+WantedBy=multi-user.target
