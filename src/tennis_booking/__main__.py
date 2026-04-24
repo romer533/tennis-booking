@@ -73,6 +73,20 @@ def _resolve_log_dir() -> Path:
     return DEFAULT_LOG_DIR
 
 
+def _parse_ntp_required(env_value: str | None) -> bool:
+    """TENNIS_NTP_REQUIRED escape hatch for dev environments without NTP.
+
+    Default is True (production) — only the explicit falsy strings below
+    disable the startup NTP fail-fast. Anything else (including unrecognised
+    values like "yes" or "1") is treated as truthy so a typo cannot silently
+    weaken production posture.
+    """
+    if env_value is None:
+        return True
+    normalized = env_value.strip().lower()
+    return normalized not in ("0", "false", "no", "off", "")
+
+
 def _install_signal_handlers(
     event_loop: asyncio.AbstractEventLoop,
     scheduler_loop: SchedulerLoop,
@@ -129,8 +143,20 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
         altegio_config.dry_run,
     )
 
+    ntp_required = _parse_ntp_required(os.environ.get("TENNIS_NTP_REQUIRED"))
+    if not ntp_required:
+        logger.warning(
+            "ntp_required=False (TENNIS_NTP_REQUIRED env override) "
+            "— will not fail-fast on NTP errors"
+        )
+
     async with AltegioClient(altegio_config) as client:
-        scheduler_loop = SchedulerLoop(app_config, client, SystemClock())
+        scheduler_loop = SchedulerLoop(
+            app_config,
+            client,
+            SystemClock(),
+            ntp_required=ntp_required,
+        )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)
 

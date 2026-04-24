@@ -123,6 +123,33 @@ def test_main_with_bad_log_level_fails(
     assert "logging" in err.lower()
 
 
+def test_ntp_required_default_true() -> None:
+    """No env → ntp_required=True (production posture)."""
+    assert cli._parse_ntp_required(None) is True
+
+
+def test_ntp_required_env_zero_false() -> None:
+    assert cli._parse_ntp_required("0") is False
+
+
+def test_ntp_required_env_false_string_false() -> None:
+    assert cli._parse_ntp_required("false") is False
+    # Case-insensitive + whitespace tolerance — env values from shell often have one or the other.
+    assert cli._parse_ntp_required(" FALSE ") is False
+    assert cli._parse_ntp_required("no") is False
+    assert cli._parse_ntp_required("off") is False
+    assert cli._parse_ntp_required("") is False
+
+
+def test_ntp_required_env_truthy_default() -> None:
+    """Anything not in the explicit falsy set stays True — typos must NOT weaken posture."""
+    assert cli._parse_ntp_required("1") is True
+    assert cli._parse_ntp_required("true") is True
+    assert cli._parse_ntp_required("yes") is True
+    # Unrecognised value → treated as True (fail-safe).
+    assert cli._parse_ntp_required("maybe") is True
+
+
 def test_install_signal_handlers_on_windows_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -63,4 +63,5 @@ jobs:
 
       - name: Report status
         if: always()
-        run: echo "Deploy status: ${{ job.status }}"
+        run: |
+          echo "Deploy status: ${{ job.status }}"
