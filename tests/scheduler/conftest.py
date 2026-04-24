@@ -10,6 +10,7 @@ import pytest
 from tennis_booking.altegio.client import AltegioClient
 from tennis_booking.common.clock import Clock
 from tennis_booking.engine.attempt import AttemptConfig, AttemptResult, BookingAttempt
+from tennis_booking.persistence import BookingStore
 from tennis_booking.scheduler.clock import CheckResult
 from tennis_booking.scheduler.clock_errors import ClockDriftError, NTPUnreachableError
 
@@ -164,7 +165,10 @@ def fake_attempt_factory() -> Callable[..., Any]:
         results_iter = iter(results_per_call) if results_per_call is not None else None
 
         def _factory(
-            config: AttemptConfig, client: AltegioClient, clock: Clock
+            config: AttemptConfig,
+            client: AltegioClient,
+            clock: Clock,
+            store: BookingStore | None = None,
         ) -> BookingAttempt:
             chosen_result: AttemptResult | None = result
             if results_iter is not None:

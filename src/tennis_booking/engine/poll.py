@@ -16,6 +16,8 @@ from tennis_booking.altegio import (
 )
 from tennis_booking.common.clock import Clock
 from tennis_booking.common.tz import ALMATY
+from tennis_booking.persistence import BookedSlot, BookingStore
+from tennis_booking.persistence.models import SCHEMA_VERSION
 
 from .attempt import AttemptConfig, AttemptResult, AttemptStatus
 from .codes import CONFIG_ERROR_CODES, SLOT_TAKEN_CODES
@@ -77,11 +79,13 @@ class PollAttempt:
         client: AltegioClient,
         clock: Clock,
         won_event: asyncio.Event | None = None,
+        store: BookingStore | None = None,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
         self._client = client
         self._clock = clock
+        self._store = store
         self._won_event = won_event if won_event is not None else asyncio.Event()
         self._used = False
         self._attempt_id = uuid.uuid4().hex
@@ -333,6 +337,7 @@ class PollAttempt:
 
         try:
             won_booking: BookingResponse | None = None
+            won_court_id: int | None = None
             slot_taken_code: str | None = None
             config_err_code: str | None = None
             transport_cause_seen: str | None = None
@@ -359,6 +364,7 @@ class PollAttempt:
                         )
                         if won_booking is None:
                             won_booking = booking
+                            won_court_id = self._config.court_ids[idx]
                         else:
                             duplicates.append(booking)
                         continue
@@ -403,6 +409,8 @@ class PollAttempt:
                         transport_cause_seen = type(exc).__name__
 
             if won_booking is not None:
+                assert won_court_id is not None  # set together with won_booking
+                await self._persist_win(won_booking, won_court_id)
                 self._log.info(
                     "poll_result",
                     status="won",
@@ -490,6 +498,27 @@ class PollAttempt:
                     task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _persist_win(self, booking: BookingResponse, court_id: int) -> None:
+        if self._store is None:
+            return
+        try:
+            slot = BookedSlot(
+                schema_version=SCHEMA_VERSION,
+                record_id=booking.record_id,
+                record_hash=booking.record_hash,
+                slot_dt_local=self._config.slot_dt_local,
+                court_id=court_id,
+                service_id=self._config.service_id,
+                profile_name=self._config.profile_name,
+                phase="poll",
+                booked_at_utc=self._clock.now_utc(),
+            )
+            await self._store.append(slot)
+        except Exception:
+            self._log.exception(
+                "persistence_append_failed", record_id=booking.record_id
+            )
 
     def _make_result(
         self,

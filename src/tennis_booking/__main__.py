@@ -25,11 +25,14 @@ from tennis_booking.common.clock import SystemClock
 from tennis_booking.config.errors import ConfigError
 from tennis_booking.config.loader import load_app_config
 from tennis_booking.obs import setup_logging
+from tennis_booking.persistence.cli import add_import_record_subparser, run_import_record
+from tennis_booking.persistence.store import FileBookingStore
 from tennis_booking.scheduler.loop import SchedulerLoop
 
 DEFAULT_CONFIG_DIR = Path("/etc/tennis-booking")
 DEFAULT_LOG_DIR = Path("/var/log/tennis-booking")
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_BOOKINGS_FILE = Path("/app/data/bookings.jsonl")
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -63,7 +66,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Equivalent to env ALTEGIO_DRY_RUN=1; CLI flag wins if set."
         ),
     )
+    subparsers = parser.add_subparsers(dest="subcommand")
+    add_import_record_subparser(subparsers)
     return parser.parse_args(argv)
+
+
+def _resolve_store_path() -> Path:
+    raw = os.environ.get("TENNIS_BOOKINGS_FILE")
+    if raw and raw.strip():
+        return Path(raw.strip())
+    return DEFAULT_BOOKINGS_FILE
 
 
 def _resolve_log_dir() -> Path:
@@ -150,12 +162,27 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "— will not fail-fast on NTP errors"
         )
 
+    store_path = _resolve_store_path()
+    try:
+        store = FileBookingStore(store_path)
+    except ValueError as e:
+        logger.error("store_init_failed: %s", e)
+        print(
+            f"ERROR: cannot initialise FileBookingStore at {store_path}: {e}. "
+            "Ensure parent directory exists (mounted /app/data inside container, "
+            "/var/lib/tennis-booking/data on host).",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    logger.info("store_initialised: path=%s", store_path)
+
     async with AltegioClient(altegio_config) as client:
         scheduler_loop = SchedulerLoop(
             app_config,
             client,
             SystemClock(),
             ntp_required=ntp_required,
+            store=store,
         )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)
@@ -175,6 +202,13 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
 async def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    # CLI subcommand path: short-circuit before logging / config / Altegio
+    # init — these subcommands are admin tools and should not require a full
+    # service config to be present on disk.
+    if args.subcommand == "import-record":
+        return await run_import_record(args, _resolve_store_path())
+
     log_dir = _resolve_log_dir()
 
     try:

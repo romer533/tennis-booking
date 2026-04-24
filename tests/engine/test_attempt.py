@@ -70,6 +70,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_utc_datetime_rejected(self) -> None:
@@ -80,6 +81,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_empty_fullname_rejected(self) -> None:
@@ -90,6 +92,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="   ",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_empty_phone_rejected(self) -> None:
@@ -100,6 +103,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone=" ",
+                profile_name="roman",
             )
 
     def test_zero_court_id_rejected(self) -> None:
@@ -110,6 +114,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_negative_service_id_rejected(self) -> None:
@@ -120,6 +125,7 @@ class TestAttemptConfigValidation:
                 service_id=-5,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
             )
 
     def test_zero_parallel_shots_rejected(self) -> None:
@@ -130,6 +136,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
                 parallel_shots=0,
             )
 
@@ -141,6 +148,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
                 not_open_deadline_s=5.0,
                 global_deadline_s=5.0,
             )
@@ -153,6 +161,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
                 not_open_deadline_s=10.0,
                 global_deadline_s=5.0,
             )
@@ -165,6 +174,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
                 not_open_deadline_s=0,
                 global_deadline_s=1.0,
             )
@@ -177,6 +187,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
                 not_open_retry_ms=5,
             )
 
@@ -188,6 +199,7 @@ class TestAttemptConfigValidation:
                 service_id=1,
                 fullname="Roman",
                 phone="77000",
+                profile_name="roman",
                 prearm_lead_s=0,
             )
 
@@ -199,6 +211,7 @@ class TestAttemptConfigValidation:
             service_id=1,
             fullname=" Roman ",
             phone="77000",
+            profile_name="roman",
         )
         assert cfg.fullname == " Roman "
 
@@ -209,6 +222,7 @@ class TestAttemptConfigValidation:
             service_id=1,
             fullname="Roman",
             phone="77000",
+            profile_name="roman",
         )
         assert cfg.parallel_shots == 2
         assert cfg.not_open_retry_ms == 100
