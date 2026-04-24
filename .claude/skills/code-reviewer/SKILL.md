@@ -18,7 +18,7 @@ description: Независимый ревьюер кода tennis-booking. Ак
 
 - [ ] **Нет `time.sleep()` в коде проекта.** Только `asyncio.sleep`. (`grep -rn "time.sleep" src/`)
 - [ ] **Нет наивных `datetime`** (без tzinfo) в коде, работающем с расписанием. Все `datetime.now()` — c `tz=`.
-- [ ] **Нет хардкода `b551098` или `Atyrau` в нескольких местах** — только в одном модуле констант.
+- [ ] **Нет хардкода `b551098` или `Almaty` в нескольких местах** — только в одном модуле констант.
 - [ ] **AltegioBusinessError vs AltegioTransportError** — не сливаются в один `except`. Engine действует на них **по-разному**.
 - [ ] **Нет `requests` (синхронный HTTP).** Только `httpx`.
 - [ ] **Нет реальных HTTP-вызовов в тестах.** Только `respx`. (`grep -rn "httpx.AsyncClient(" tests/` — все вызовы должны быть замоканы.)
