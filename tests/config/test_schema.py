@@ -374,7 +374,7 @@ class TestResolvedBooking:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -388,7 +388,7 @@ class TestResolvedBooking:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -397,7 +397,7 @@ class TestResolvedBooking:
         assert "<profile:roman>" in s
         assert "Очень" not in s
         assert "Секретное" not in s
-        assert "court=5" in s
+        assert "courts=[5]" in s
         assert "weekday=friday" in s
         assert "Пятница" in s
 
@@ -408,7 +408,7 @@ class TestResolvedBooking:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -422,7 +422,7 @@ class TestResolvedBooking:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -439,7 +439,7 @@ class TestAppConfig:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -447,6 +447,7 @@ class TestAppConfig:
         ac = AppConfig(
             bookings=(rb,),
             profiles=MappingProxyType({"roman": p}),
+            court_pools=MappingProxyType({}),
         )
         assert len(ac.bookings) == 1
         assert ac.profiles["roman"] is p
@@ -458,7 +459,7 @@ class TestAppConfig:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -466,6 +467,7 @@ class TestAppConfig:
         ac = AppConfig(
             bookings=(rb,),
             profiles=MappingProxyType({"roman": p}),
+            court_pools=MappingProxyType({}),
         )
         s = repr(ac)
         assert "Очень" not in s
@@ -481,7 +483,7 @@ class TestAppConfig:
             weekday=Weekday.FRIDAY,
             slot_local_time=time(18, 0),
             duration_minutes=60,
-            court_id=5,
+            court_ids=(5,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -491,7 +493,7 @@ class TestAppConfig:
             weekday=Weekday.SUNDAY,
             slot_local_time=time(9, 0),
             duration_minutes=60,
-            court_id=6,
+            court_ids=(6,),
             service_id=7849893,
             profile=p,
             enabled=True,
@@ -499,6 +501,7 @@ class TestAppConfig:
         ac = AppConfig(
             bookings=(rb1, rb2),
             profiles=MappingProxyType({"roman": p}),
+            court_pools=MappingProxyType({}),
         )
         s = repr(ac)
         assert "2 bookings" in s
@@ -509,6 +512,7 @@ class TestAppConfig:
         ac = AppConfig(
             bookings=(),
             profiles=MappingProxyType({"roman": p}),
+            court_pools=MappingProxyType({}),
         )
         assert str(ac) == repr(ac)
 
@@ -517,6 +521,7 @@ class TestAppConfig:
         ac = AppConfig(
             bookings=(),
             profiles=MappingProxyType({"roman": p}),
+            court_pools=MappingProxyType({}),
         )
         assert isinstance(ac.bookings, tuple)
 
@@ -541,11 +546,16 @@ class TestAppConfigValidation:
             AppConfig(
                 bookings=(),
                 profiles="not a mapping",  # type: ignore[arg-type]
+                court_pools=MappingProxyType({}),
             )
 
     def test_profiles_plain_dict_is_wrapped(self) -> None:
         p = make_profile()
-        ac = AppConfig(bookings=(), profiles={"roman": p})  # type: ignore[arg-type]
+        ac = AppConfig(  # type: ignore[arg-type]
+            bookings=(),
+            profiles={"roman": p},
+            court_pools={},
+        )
         assert isinstance(ac.profiles, MappingProxyType)
         with pytest.raises(TypeError):
             ac.profiles["other"] = p  # type: ignore[index]

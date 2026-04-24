@@ -9,7 +9,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from .errors import ConfigError
-from .schema import AppConfig, BookingRule, Profile, ResolvedBooking
+from .schema import AppConfig, BookingRule, CourtPool, Profile, ResolvedBooking
 
 SCHEDULE_FILENAME = "schedule.yaml"
 PROFILES_FILENAME = "profiles.yaml"
@@ -108,6 +108,63 @@ def load_profiles(path: Path) -> dict[str, Profile]:
     return result
 
 
+def _load_court_pools_from_raw(
+    raw: Any, filename: str
+) -> dict[str, CourtPool]:
+    """Парсит секцию court_pools (mapping name → {service_id, court_ids})."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{filename} 'court_pools' must be a mapping of name → pool data, "
+            f"got {type(raw).__name__}"
+        )
+    result: dict[str, CourtPool] = {}
+    for name, data in raw.items():
+        if not isinstance(name, str):
+            raise ConfigError(
+                f"{filename}: court_pool name must be a string, got {type(name).__name__}"
+            )
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"{filename}: court_pool {name!r} must be a mapping, "
+                f"got {type(data).__name__}"
+            )
+        try:
+            pool = CourtPool(**data)
+        except ValidationError as e:
+            raise ConfigError(
+                _format_validation_error(filename, e, context=f"court_pool {name!r}")
+            ) from e
+        except TypeError as e:
+            raise ConfigError(
+                f"invalid {filename} (court_pool {name!r}): {e}"
+            ) from e
+        # Pool name must be valid identifier (regex same as in BookingRule.court_pool).
+        from .schema import POOL_NAME_RE
+
+        if not POOL_NAME_RE.fullmatch(name):
+            raise ConfigError(
+                f"{filename}: court_pool name must match [a-z0-9_-]+, got {name!r}"
+            )
+        result[name] = pool
+    return result
+
+
+def load_court_pools(path: Path) -> dict[str, CourtPool]:
+    """Читает schedule.yaml и возвращает name → CourtPool. Пустой/отсутствующий
+    section даёт пустой dict — допустимо для legacy schedule без pools.
+    """
+    raw = _read_yaml(path, "schedule.example.yaml")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{path.name} root must be a mapping with 'bookings' key"
+        )
+    return _load_court_pools_from_raw(raw.get("court_pools"), path.name)
+
+
 def load_schedule(path: Path) -> tuple[BookingRule, ...]:
     """Читает schedule.yaml и возвращает кортеж BookingRule."""
     raw = _read_yaml(path, "schedule.example.yaml")
@@ -123,7 +180,7 @@ def load_schedule(path: Path) -> tuple[BookingRule, ...]:
         logger.warning("schedule has 0 bookings")
         return ()
 
-    extra_keys = set(raw.keys()) - {"bookings"}
+    extra_keys = set(raw.keys()) - {"bookings", "court_pools"}
     if extra_keys:
         raise ConfigError(
             f"{path.name}: unexpected top-level keys: {sorted(extra_keys)}"
@@ -162,37 +219,63 @@ def load_schedule(path: Path) -> tuple[BookingRule, ...]:
 
 
 def _resolve(
-    rules: tuple[BookingRule, ...], profiles: dict[str, Profile]
+    rules: tuple[BookingRule, ...],
+    profiles: dict[str, Profile],
+    pools: dict[str, CourtPool],
 ) -> tuple[ResolvedBooking, ...]:
-    by_slot: dict[tuple[str, str, int], str] = {}
+    # Cross-validation: per-court dedup is done over EXPANDED court_ids, so a
+    # legacy single-court booking conflicts with a pool-booking that contains
+    # the same court at the same (weekday, slot).
+    court_owner: dict[tuple[str, str, int], str] = {}
     resolved: list[ResolvedBooking] = []
+
     for rule in rules:
         if rule.profile not in profiles:
             raise ConfigError(
                 f"booking {rule.name!r} references unknown profile "
                 f"{rule.profile!r} (known profiles: {sorted(profiles.keys())})"
             )
-        slot_key = (
-            rule.weekday.value,
-            rule.slot_local_time.strftime("%H:%M"),
-            rule.court_id,
-        )
-        if slot_key in by_slot:
-            raise ConfigError(
-                f"duplicate booking slot ({slot_key[0]} {slot_key[1]} "
-                f"court={slot_key[2]}): {by_slot[slot_key]!r} and {rule.name!r}"
-            )
-        by_slot[slot_key] = rule.name
+
+        if rule.court_pool is not None:
+            if rule.court_pool not in pools:
+                raise ConfigError(
+                    f"booking {rule.name!r} references unknown pool "
+                    f"{rule.court_pool!r} (known pools: {sorted(pools.keys())})"
+                )
+            pool = pools[rule.court_pool]
+            court_ids = pool.court_ids
+            service_id = pool.service_id
+            pool_name: str | None = rule.court_pool
+        else:
+            assert rule.court_id is not None  # XOR guarantees this
+            assert rule.service_id is not None
+            court_ids = (rule.court_id,)
+            service_id = rule.service_id
+            pool_name = None
+
+        weekday_s = rule.weekday.value
+        slot_s = rule.slot_local_time.strftime("%H:%M")
+        for cid in court_ids:
+            slot_key = (weekday_s, slot_s, cid)
+            existing = court_owner.get(slot_key)
+            if existing is not None:
+                raise ConfigError(
+                    f"duplicate booking slot ({weekday_s} {slot_s} "
+                    f"court={cid}): {existing!r} and {rule.name!r}"
+                )
+            court_owner[slot_key] = rule.name
+
         resolved.append(
             ResolvedBooking(
                 name=rule.name,
                 weekday=rule.weekday,
                 slot_local_time=rule.slot_local_time,
                 duration_minutes=rule.duration_minutes,
-                court_id=rule.court_id,
-                service_id=rule.service_id,
+                court_ids=court_ids,
+                service_id=service_id,
                 profile=profiles[rule.profile],
                 enabled=rule.enabled,
+                pool_name=pool_name,
             )
         )
     return tuple(resolved)
@@ -206,15 +289,23 @@ def load_app_config(config_dir: Path) -> AppConfig:
         raise ConfigError(f"config path is not a directory: {config_dir}")
 
     profiles = load_profiles(config_dir / PROFILES_FILENAME)
-    rules = load_schedule(config_dir / SCHEDULE_FILENAME)
-    resolved = _resolve(rules, profiles)
+    schedule_path = config_dir / SCHEDULE_FILENAME
+    pools = load_court_pools(schedule_path)
+    rules = load_schedule(schedule_path)
+    resolved = _resolve(rules, profiles, pools)
 
-    referenced = {r.profile.name for r in resolved}
+    referenced_profiles = {r.profile.name for r in resolved}
     for name in profiles:
-        if name not in referenced:
+        if name not in referenced_profiles:
             logger.warning("profile %r is defined but not referenced by any booking", name)
+
+    referenced_pools = {r.pool_name for r in resolved if r.pool_name is not None}
+    for name in pools:
+        if name not in referenced_pools:
+            logger.warning("court_pool %r is defined but not referenced by any booking", name)
 
     return AppConfig(
         bookings=resolved,
         profiles=MappingProxyType(dict(profiles)),
+        court_pools=MappingProxyType(dict(pools)),
     )

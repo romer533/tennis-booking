@@ -12,6 +12,7 @@ from tennis_booking.altegio import BookingResponse
 from tennis_booking.common.tz import ALMATY
 from tennis_booking.config.schema import (
     AppConfig,
+    CourtPool,
     Profile,
     ResolvedBooking,
     Weekday,
@@ -49,31 +50,40 @@ def _booking(
     name: str = "fri-eve",
     weekday: Weekday = Weekday.FRIDAY,
     slot_local_time: time = time(18, 0),
-    court_id: int = STAFF_ID,
+    court_id: int | None = None,
+    court_ids: tuple[int, ...] | None = None,
     service_id: int = SERVICE_ID,
     profile: Profile | None = None,
     enabled: bool = True,
     duration_minutes: int = 60,
+    pool_name: str | None = None,
 ) -> ResolvedBooking:
+    if court_ids is None:
+        court_ids = (court_id if court_id is not None else STAFF_ID,)
     return ResolvedBooking(
         name=name,
         weekday=weekday,
         slot_local_time=slot_local_time,
         duration_minutes=duration_minutes,
-        court_id=court_id,
+        court_ids=court_ids,
         service_id=service_id,
         profile=profile or _profile(),
         enabled=enabled,
+        pool_name=pool_name,
     )
 
 
-def _config(*bookings: ResolvedBooking) -> AppConfig:
+def _config(
+    *bookings: ResolvedBooking,
+    court_pools: dict[str, CourtPool] | None = None,
+) -> AppConfig:
     profiles_by_name: dict[str, Profile] = {}
     for b in bookings:
         profiles_by_name.setdefault(b.profile.name, b.profile)
     return AppConfig(
         bookings=tuple(bookings),
         profiles=MappingProxyType(profiles_by_name),
+        court_pools=MappingProxyType(dict(court_pools or {})),
     )
 
 
@@ -584,7 +594,7 @@ class TestAttemptLaunch:
             clock.advance(10.0)
         assert created
         ac: AttemptConfig = created[0].config
-        assert ac.court_id == 1234
+        assert ac.court_ids == (1234,)
         assert ac.service_id == 4242
         assert ac.fullname == "Alice A"
         assert ac.phone == "77777"
@@ -1007,7 +1017,7 @@ class TestAttemptConfigBuild:
                 window_open_utc=_almaty_to_utc(datetime(2030, 1, 1, 7, 0, tzinfo=ALMATY)),
             )]
         cfg_out = loop._build_attempt_config(sa[0])
-        assert cfg_out.court_id == 4242
+        assert cfg_out.court_ids == (4242,)
         assert cfg_out.service_id == 9999
         assert cfg_out.fullname == "Bob B"
         assert cfg_out.phone == "77002223344"
@@ -1116,8 +1126,9 @@ class TestScheduledKeyCollision:
             clock.advance(10.0)
         assert all(t.done() for t in tasks)
         assert len(created) == 2
-        court_ids = sorted(inst.config.court_id for inst in created)
-        assert court_ids == [5, 6]
+        # Each AttemptConfig has court_ids as a single-element tuple in legacy mode.
+        first_courts = sorted(inst.config.court_ids[0] for inst in created)
+        assert first_courts == [5, 6]
         await loop.stop()
 
     async def test_two_bookings_same_name_different_service_both_scheduled(
@@ -1368,3 +1379,101 @@ class TestShutdownTimeoutInjectable:
         client = fake_client([])
         loop = _build_loop(_config(), clock, client, ntp_checker=ok_ntp_checker)
         assert loop._shutdown_timeout_s == 60.0
+
+
+# ---------- 12. Court pool: booking → loop → AttemptConfig ------------------
+
+
+class TestCourtPoolE2EViaLoop:
+    async def test_court_pool_booking_propagates_court_ids_to_attempt(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # ResolvedBooking with court_ids tuple from a pool — loop must build
+        # AttemptConfig with the same tuple, not collapse it.
+        clock = make_clock(initial_utc=datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC))
+        client = fake_client([])
+        prof = _profile("roman")
+        b = _booking(
+            name="pool-booking",
+            weekday=Weekday.FRIDAY,
+            slot_local_time=time(18, 0),
+            court_ids=(101, 102, 103),
+            service_id=7849893,
+            profile=prof,
+            pool_name="indoor",
+        )
+        cfg = _config(
+            b,
+            court_pools={
+                "indoor": CourtPool(service_id=7849893, court_ids=(101, 102, 103))
+            },
+        )
+        factory, created = fake_attempt_factory()
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+
+        sched = await loop._recompute_windows(clock.now_utc())
+        assert len(sched) == 1
+        loop._spawn_attempts(sched)
+        task = next(iter(loop._scheduled.values()))
+        for _ in range(50):
+            if task.done():
+                break
+            await asyncio.sleep(0)
+            clock.advance(10.0)
+        assert task.done()
+        assert len(created) == 1
+        ac = created[0].config
+        assert ac.court_ids == (101, 102, 103)
+        assert ac.service_id == 7849893
+        await loop.stop()
+
+    async def test_pool_booking_scheduled_key_distinct_from_legacy(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # A pool booking and a legacy single-court booking targeting the same
+        # name/slot/service but different court_ids must not collide in
+        # _scheduled (their hash(court_ids) differ).
+        clock = make_clock(initial_utc=datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC))
+        client = fake_client([])
+        prof = _profile("roman")
+        b1 = _booking(
+            name="x",
+            weekday=Weekday.FRIDAY,
+            slot_local_time=time(18, 0),
+            court_ids=(50, 60),
+            service_id=7849893,
+            profile=prof,
+            pool_name="p",
+        )
+        b2 = _booking(
+            name="x",
+            weekday=Weekday.FRIDAY,
+            slot_local_time=time(18, 0),
+            court_ids=(99,),
+            service_id=7849893,
+            profile=prof,
+        )
+        cfg = _config(
+            b1, b2,
+            court_pools={"p": CourtPool(service_id=7849893, court_ids=(50, 60))},
+        )
+        factory, _created = fake_attempt_factory()
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+        sched = await loop._recompute_windows(clock.now_utc())
+        loop._spawn_attempts(sched)
+        assert len(loop._scheduled) == 2, (
+            "pool+legacy with different court_ids must be tracked as separate keys"
+        )
+        await loop.stop()
