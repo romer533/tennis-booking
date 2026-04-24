@@ -76,8 +76,17 @@ def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
     return _check
 
 
-def _scheduled_key(booking_name: str, slot_dt_local: datetime) -> tuple[str, str]:
-    return (booking_name, slot_dt_local.isoformat())
+def _scheduled_key(
+    booking_name: str,
+    slot_dt_local: datetime,
+    court_id: int,
+    service_id: int,
+) -> tuple[str, str, int, int]:
+    # Two BookingRule's can legally share a `name` (config loader dedupes by
+    # (weekday, slot_time, court_id), not name) — for example "Вечер" on court 5
+    # and "Вечер" on court 6 when the user wants either court. Keying only by
+    # (name, slot) would silently drop one of them as a duplicate.
+    return (booking_name, slot_dt_local.isoformat(), court_id, service_id)
 
 
 class SchedulerLoop:
@@ -98,6 +107,7 @@ class SchedulerLoop:
         ntp_threshold_ms: int = DEFAULT_NTP_THRESHOLD_MS,
         attempt_factory: AttemptFactory | None = None,
         ntp_checker: NTPChecker | None = None,
+        shutdown_timeout_s: float = SHUTDOWN_TIMEOUT_S,
     ) -> None:
         self._config = config
         self._client = altegio_client
@@ -105,6 +115,7 @@ class SchedulerLoop:
         self._recompute_local_time = recompute_local_time
         self._ntp_required = ntp_required
         self._ntp_threshold_ms = ntp_threshold_ms
+        self._shutdown_timeout_s = shutdown_timeout_s
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
@@ -115,7 +126,7 @@ class SchedulerLoop:
         self._loop_id = uuid.uuid4().hex
         self._log = structlog.get_logger("scheduler.loop").bind(loop_id=self._loop_id)
 
-        self._scheduled: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._scheduled: dict[tuple[str, str, int, int], asyncio.Task[None]] = {}
         # Tasks that crossed into the "running" (post-prearm) phase. On stop(), these
         # are awaited (with deadline) instead of being cancelled — losing a slot
         # mid-fire because of SIGTERM is the worst possible outcome.
@@ -131,16 +142,24 @@ class SchedulerLoop:
         await self._startup_ntp_check()
 
         try:
+            # First recompute fires immediately at startup, regardless of how
+            # close `now` is to the daily recompute time. This avoids a tight
+            # loop on exact-match start (06:55:00 → next_recompute_at == now,
+            # delay 0, recompute, next_recompute_at == now again, ...).
+            scheduled = await self._safe_recompute(self._clock.now_utc())
+            self._spawn_attempts(scheduled)
+
             while not self._stop_event.is_set():
                 now_utc = self._clock.now_utc()
-                scheduled = await self._safe_recompute(now_utc)
-                self._spawn_attempts(scheduled)
-
                 next_recompute_utc = self._next_recompute_at(now_utc)
                 delay_s = (next_recompute_utc - now_utc).total_seconds()
                 if delay_s < 0:
                     delay_s = 0.0
                 await self._wait_or_stop(delay_s)
+                if self._stop_event.is_set():
+                    break
+                scheduled = await self._safe_recompute(self._clock.now_utc())
+                self._spawn_attempts(scheduled)
         finally:
             await self.stop()
 
@@ -169,10 +188,10 @@ class SchedulerLoop:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*all_tasks, return_exceptions=True),
-                    timeout=SHUTDOWN_TIMEOUT_S,
+                    timeout=self._shutdown_timeout_s,
                 )
             except TimeoutError:
-                self._log.warning("shutdown_timeout", timeout_s=SHUTDOWN_TIMEOUT_S)
+                self._log.warning("shutdown_timeout", timeout_s=self._shutdown_timeout_s)
                 # Last-resort cancel for stuck running tasks.
                 for task in all_tasks:
                     if not task.done():
@@ -247,7 +266,12 @@ class SchedulerLoop:
 
     def _spawn_attempts(self, scheduled: list[ScheduledAttempt]) -> None:
         for sa in scheduled:
-            key = _scheduled_key(sa.booking.name, sa.slot_dt_local)
+            key = _scheduled_key(
+                sa.booking.name,
+                sa.slot_dt_local,
+                sa.booking.court_id,
+                sa.booking.service_id,
+            )
             existing = self._scheduled.get(key)
             if existing is not None and not existing.done():
                 self._log.info(
@@ -271,7 +295,12 @@ class SchedulerLoop:
 
     async def _wait_and_attempt(self, scheduled: ScheduledAttempt) -> None:
         booking = scheduled.booking
-        key = _scheduled_key(booking.name, scheduled.slot_dt_local)
+        key = _scheduled_key(
+            booking.name,
+            scheduled.slot_dt_local,
+            booking.court_id,
+            booking.service_id,
+        )
 
         log = self._log.bind(
             booking_name=booking.name,
@@ -378,8 +407,15 @@ class SchedulerLoop:
     # --- timing helpers -------------------------------------------------
 
     def _next_recompute_at(self, now_utc: datetime) -> datetime:
-        """Возвращает UTC момент следующего recompute (ближайший в будущем,
-        либо `now_utc`, если сегодняшнее время recompute ещё не прошло)."""
+        """UTC момент следующего recompute строго в будущем (либо ровно сейчас,
+        если сегодняшний recompute ещё впереди).
+
+        Если `now` >= сегодняшнего recompute (включая exact match) — возвращаем
+        завтрашний recompute. Exact match → tomorrow гарантирует, что после
+        выполнения recompute в 06:55:00 цикл не вычислит delay==0 и не сорвётся
+        в tight-loop на FakeClock без advance(). Первый recompute при старте
+        run() выполняется отдельно (см. `run`).
+        """
         now_local = now_utc.astimezone(ALMATY)
         today_recompute = datetime(
             now_local.year,
@@ -391,9 +427,6 @@ class SchedulerLoop:
         )
         if now_local < today_recompute:
             target_local = today_recompute
-        elif now_local == today_recompute:
-            # Exact match → recompute now, then next round in 24h.
-            return now_utc
         else:
             target_local = today_recompute + timedelta(days=1)
         return target_local.astimezone(now_utc.tzinfo)

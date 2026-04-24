@@ -251,18 +251,24 @@ class TestRecomputeTiming:
         assert target_local.hour == 6 and target_local.minute == 55
         assert (target - clock.now_utc()).total_seconds() == pytest.approx(1.0, abs=0.01)
 
-    async def test_next_recompute_at_06_55_00_returns_now(
+    async def test_next_recompute_at_06_55_00_returns_tomorrow(
         self,
         fake_client: Callable[..., FakeAltegioClient],
         make_clock: Callable[..., FakeClock],
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
+        # Exact-match semantics changed: today's recompute is "already done"
+        # by the run() startup-immediate path, so _next_recompute_at returns
+        # tomorrow's slot — this avoids tight-loop on FakeClock at 06:55:00.
         clock = make_clock(initial_utc=datetime(2026, 4, 24, 1, 55, 0, tzinfo=UTC))
         client = fake_client([])
         loop = _build_loop(_config(), clock, client, ntp_checker=ok_ntp_checker)
         target = loop._next_recompute_at(clock.now_utc())
-        # exact match → trigger now
-        assert target == clock.now_utc()
+        delta = (target - clock.now_utc()).total_seconds()
+        # Tomorrow 06:55 Almaty → exactly 24h ahead.
+        assert delta == pytest.approx(86400.0, abs=0.01)
+        target_local = target.astimezone(ALMATY)
+        assert target_local.hour == 6 and target_local.minute == 55
 
     async def test_next_recompute_at_06_55_01_returns_tomorrow(
         self,
@@ -1050,3 +1056,315 @@ class TestIntegration:
         assert task.done(), "real BookingAttempt did not finish in time-budget"
         assert task.exception() is None
         await loop.stop()
+
+
+# ---------- 9. CR regression: scheduled_key collision -----------------------
+
+
+class TestScheduledKeyCollision:
+    async def test_two_bookings_same_name_different_court_both_scheduled(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # Two BookingRule share name="Вечер" but differ by court_id. This is legal:
+        # loader dedupes by (weekday, slot_time, court_id), not by name. Before the
+        # fix the second one was silently dropped as "duplicate".
+        now_utc = datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC)  # Tue 06:55 Almaty
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        prof = _profile("roman")
+        cfg = _config(
+            _booking(
+                name="Вечер",
+                weekday=Weekday.FRIDAY,
+                slot_local_time=time(18, 0),
+                court_id=5,
+                service_id=SERVICE_ID,
+                profile=prof,
+            ),
+            _booking(
+                name="Вечер",
+                weekday=Weekday.FRIDAY,
+                slot_local_time=time(18, 0),
+                court_id=6,
+                service_id=SERVICE_ID,
+                profile=prof,
+            ),
+        )
+        factory, created = fake_attempt_factory()
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+
+        sched = await loop._recompute_windows(now_utc)
+        assert len(sched) == 2, "recompute must produce two ScheduledAttempt"
+        loop._spawn_attempts(sched)
+        assert len(loop._scheduled) == 2, (
+            "both same-name different-court bookings must be scheduled; "
+            "if only 1, the key is still colliding"
+        )
+
+        # Drive both tasks to completion to confirm both BookingAttempts run.
+        tasks = list(loop._scheduled.values())
+        for _ in range(50):
+            if all(t.done() for t in tasks):
+                break
+            await asyncio.sleep(0)
+            clock.advance(10.0)
+        assert all(t.done() for t in tasks)
+        assert len(created) == 2
+        court_ids = sorted(inst.config.court_id for inst in created)
+        assert court_ids == [5, 6]
+        await loop.stop()
+
+    async def test_two_bookings_same_name_different_service_both_scheduled(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # Same court_id, same name, but different service_id — service_id is part
+        # of the key for maximum conservatism. Note: loader normally dedupes
+        # (weekday, slot, court_id), so this combo wouldn't pass loader validation,
+        # but the key must still distinguish them for in-memory correctness.
+        now_utc = datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        prof = _profile("roman")
+        b1 = _booking(
+            name="same", weekday=Weekday.FRIDAY, slot_local_time=time(18, 0),
+            court_id=10, service_id=111, profile=prof,
+        )
+        b2 = _booking(
+            name="same", weekday=Weekday.FRIDAY, slot_local_time=time(18, 0),
+            court_id=10, service_id=222, profile=prof,
+        )
+        cfg = _config(b1, b2)
+        factory, _created = fake_attempt_factory()
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+
+        sched = await loop._recompute_windows(now_utc)
+        assert len(sched) == 2
+        loop._spawn_attempts(sched)
+        assert len(loop._scheduled) == 2, (
+            "service_id must also participate in dedup key"
+        )
+        await loop.stop()
+
+
+# ---------- 10. CR regression: tight-loop at exact recompute time -----------
+
+
+class TestTightLoopAtExactRecompute:
+    async def test_start_at_06_55_00_recompute_immediately_then_tomorrow(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # 06:55:00 Almaty = 01:55:00 UTC. Start the loop at the exact daily
+        # recompute time. Before the fix this was an infinite tight loop on
+        # FakeClock (delay_s → 0, recompute, delay_s → 0, ...).
+        # Empty config keeps the clock stable (no spawned task sleeps).
+        now_utc = datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config()
+        factory, _created = fake_attempt_factory()
+
+        call_count = {"n": 0}
+
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+        real_recompute = loop._recompute_windows
+
+        async def counting_recompute(now: datetime) -> list[Any]:
+            call_count["n"] += 1
+            return await real_recompute(now)
+
+        loop._recompute_windows = counting_recompute  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(loop.run())
+        # Let startup NTP + first immediate recompute land.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert call_count["n"] == 1, (
+            "immediate recompute at startup must have run exactly once"
+        )
+
+        # Clock hasn't moved (empty config, no sleeps) — next recompute is +24h.
+        assert clock.now_utc() == now_utc
+        next_at = loop._next_recompute_at(clock.now_utc())
+        delta = (next_at - clock.now_utc()).total_seconds()
+        assert delta == pytest.approx(86400.0, abs=0.01)
+
+        await loop.stop()
+        await run_task
+
+    async def test_start_at_06_54_59_recompute_immediately(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # Just-before-recompute start: first recompute still fires immediately
+        # (not waiting 1s), then next is today's 06:55 (1s ahead).
+        now_utc = datetime(2026, 4, 21, 1, 54, 59, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        # Empty config: clock stays still, we can inspect _next_recompute_at cleanly.
+        cfg = _config()
+        factory, _created = fake_attempt_factory()
+
+        call_count = {"n": 0}
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+        real_recompute = loop._recompute_windows
+
+        async def counting_recompute(now: datetime) -> list[Any]:
+            call_count["n"] += 1
+            return await real_recompute(now)
+
+        loop._recompute_windows = counting_recompute  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(loop.run())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert call_count["n"] == 1, (
+            "first recompute must run immediately at startup regardless of time"
+        )
+
+        # The next-target is today's 06:55 — 1s ahead.
+        next_at = loop._next_recompute_at(clock.now_utc())
+        delta = (next_at - clock.now_utc()).total_seconds()
+        assert delta == pytest.approx(1.0, abs=0.01)
+
+        await loop.stop()
+        await run_task
+
+    async def test_start_at_07_00_recompute_immediately_windows_skipped(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # 07:30 Almaty Tuesday = 02:30 UTC. The Friday-18:00 booking's window
+        # opens Tue 07:00 — already in the past. window_passed must filter it,
+        # so no task is spawned. The startup-immediate recompute must still run,
+        # and the next scheduled recompute must be tomorrow 06:55 (not today's
+        # already-passed 06:55 — that would be a tight loop).
+        now_utc = datetime(2026, 4, 21, 2, 30, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config(
+            _booking(weekday=Weekday.FRIDAY, slot_local_time=time(18, 0)),
+        )
+        factory, created = fake_attempt_factory()
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+
+        run_task = asyncio.create_task(loop.run())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # Recompute ran, but the only window was already in the past → no task.
+        assert len(loop._scheduled) == 0
+        assert created == []
+        # Next recompute = tomorrow 06:55 (clock unchanged — no tasks sleeping).
+        assert clock.now_utc() == now_utc
+        next_at = loop._next_recompute_at(clock.now_utc())
+        target_local = next_at.astimezone(ALMATY)
+        assert target_local.hour == 6 and target_local.minute == 55
+        assert (target_local.date() - clock.now_utc().astimezone(ALMATY).date()).days == 1
+
+        await loop.stop()
+        await run_task
+
+    async def test_loop_does_not_spin_at_exact_match_without_clock_advance(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+        fake_attempt_factory: Callable[..., Any],
+    ) -> None:
+        # Direct tight-loop regression: start exactly at recompute time, do NOT
+        # advance the FakeClock, give the loop several scheduler ticks, then
+        # ensure recompute was invoked exactly once (startup-immediate) and the
+        # loop is parked waiting on _stop_event / timeout — not re-invoking
+        # recompute in a hot spin.
+        now_utc = datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC)
+        clock = make_clock(initial_utc=now_utc)
+        client = fake_client([])
+        cfg = _config()  # empty → recompute is cheap, fast to count invocations
+        factory, _created = fake_attempt_factory()
+        loop = _build_loop(
+            cfg, clock, client, ntp_checker=ok_ntp_checker, attempt_factory=factory
+        )
+
+        call_count = {"n": 0}
+        real_recompute = loop._recompute_windows
+
+        async def counting_recompute(now: datetime) -> list[Any]:
+            call_count["n"] += 1
+            return await real_recompute(now)
+
+        loop._recompute_windows = counting_recompute  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(loop.run())
+        # Yield many times — without fix the loop would spin here, incrementing
+        # call_count arbitrarily many times in a single sync block.
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+        assert call_count["n"] == 1, (
+            f"recompute must run exactly once at exact-match startup, got {call_count['n']}"
+        )
+
+        await loop.stop()
+        await run_task
+
+
+# ---------- 11. Nit: shutdown_timeout_s injectable --------------------------
+
+
+class TestShutdownTimeoutInjectable:
+    async def test_custom_shutdown_timeout_propagates(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+    ) -> None:
+        clock = make_clock()
+        client = fake_client([])
+        loop = SchedulerLoop(
+            config=_config(),
+            altegio_client=as_altegio_client(client),
+            clock=as_clock(clock),
+            ntp_checker=ok_ntp_checker,  # type: ignore[arg-type]
+            shutdown_timeout_s=5.0,
+        )
+        assert loop._shutdown_timeout_s == 5.0
+        # And stop() completes cleanly with the injected value.
+        await loop.stop()
+
+    async def test_default_shutdown_timeout_is_60s(
+        self,
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        ok_ntp_checker: FakeNTPChecker,
+    ) -> None:
+        clock = make_clock()
+        client = fake_client([])
+        loop = _build_loop(_config(), clock, client, ntp_checker=ok_ntp_checker)
+        assert loop._shutdown_timeout_s == 60.0
