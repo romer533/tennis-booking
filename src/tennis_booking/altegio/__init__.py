@@ -6,7 +6,7 @@ from .errors import (
     AltegioError,
     AltegioTransportError,
 )
-from .models import BookingAppointment, BookingRequest, BookingResponse
+from .models import BookingAppointment, BookingRequest, BookingResponse, TimeSlot
 
 __all__ = [
     "ALMATY",
@@ -20,4 +20,5 @@ __all__ = [
     "BookingAppointment",
     "BookingRequest",
     "BookingResponse",
+    "TimeSlot",
 ]

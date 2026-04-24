@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import date, datetime
 from types import TracebackType
 from typing import Any
 
@@ -14,11 +14,12 @@ from tennis_booking.common.tz import ALMATY
 
 from .config import AltegioConfig
 from .errors import AltegioBusinessError, AltegioTransportError
-from .models import BookingAppointment, BookingRequest, BookingResponse
+from .models import BookingAppointment, BookingRequest, BookingResponse, TimeSlot
 
-__all__ = ["ALMATY", "BOOK_RECORD_PATH", "AltegioClient"]
+__all__ = ["ALMATY", "BOOK_RECORD_PATH", "SEARCH_TIMESLOTS_PATH", "AltegioClient"]
 
 BOOK_RECORD_PATH = "/api/v1/book_record/{company_id}"
+SEARCH_TIMESLOTS_PATH = "/api/v1/booking/search/timeslots/"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=2.0)
 _DEFAULT_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
@@ -208,6 +209,209 @@ class AltegioClient:
             return BookingResponse(record_id=0, record_hash="dry-run")
 
         return await self._post_booking(request, timeout_s=timeout_s)
+
+    async def search_timeslots(
+        self,
+        *,
+        date_local: date,
+        staff_ids: list[int],
+        timeout_s: float | None = None,
+    ) -> list[TimeSlot]:
+        """POST /api/v1/booking/search/timeslots/ — read-only probe.
+
+        Возвращает массив слотов на `date_local` (Almaty local date) для кортов
+        из `staff_ids`. Каждый слот содержит `is_bookable: bool`. Используется
+        в poll-режиме для мониторинга освобождения слота.
+
+        Идемпотентен. Dry-run — всё равно реальный POST (read-only, безопасно).
+
+        Raises:
+            ValueError: pre-flight (пустой/дублирующийся staff_ids, не-int).
+            AltegioBusinessError: 4xx.
+            AltegioTransportError: 5xx, network error, non-JSON 2xx.
+        """
+        self._validate_search_inputs(staff_ids)
+
+        body: dict[str, Any] = {
+            "context": {"location_id": self._config.company_id},
+            "filter": {
+                "date": date_local.strftime("%Y-%m-%d"),
+                "records": [
+                    {"staff_id": sid, "attendance_service_items": []}
+                    for sid in staff_ids
+                ],
+            },
+        }
+
+        return await self._post_search_timeslots(body, timeout_s=timeout_s)
+
+    @staticmethod
+    def _validate_search_inputs(staff_ids: list[int]) -> None:
+        if not staff_ids:
+            raise ValueError("staff_ids must contain at least one id")
+        for sid in staff_ids:
+            if not isinstance(sid, int) or isinstance(sid, bool):
+                raise ValueError(
+                    f"staff_ids entries must be integers, got {type(sid).__name__}"
+                )
+            if sid < 1:
+                raise ValueError(f"staff_ids entries must be >= 1, got {sid}")
+        if len(set(staff_ids)) != len(staff_ids):
+            raise ValueError(
+                f"staff_ids must be unique, got duplicates in {list(staff_ids)}"
+            )
+
+    async def _post_search_timeslots(
+        self, body: dict[str, Any], *, timeout_s: float | None
+    ) -> list[TimeSlot]:
+        http = self._require_http()
+        headers = {
+            "Authorization": f"Bearer {self._config.bearer_token.get_secret_value()}",
+            "Content-Type": "application/json",
+            "accept": "application/json, text/plain, */*",
+        }
+        kwargs: dict[str, Any] = {"json": body, "headers": headers}
+        if timeout_s is not None:
+            kwargs["timeout"] = httpx.Timeout(
+                connect=_DEFAULT_TIMEOUT.connect,
+                read=timeout_s,
+                write=timeout_s,
+                pool=_DEFAULT_TIMEOUT.pool,
+            )
+
+        try:
+            response = await http.post(SEARCH_TIMESLOTS_PATH, **kwargs)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.RemoteProtocolError,
+            httpx.TransportError,
+        ) as e:
+            raise AltegioTransportError(type(e).__name__) from e
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — narrow to transport for unknown httpx issues
+            raise AltegioTransportError(f"{type(e).__name__}: {e}") from e
+
+        return self._parse_timeslots_response(response)
+
+    @staticmethod
+    def _parse_timeslots_response(response: httpx.Response) -> list[TimeSlot]:
+        status = response.status_code
+
+        if 500 <= status < 600:
+            raise AltegioTransportError(f"server error {status}")
+
+        content_type = response.headers.get("content-type", "")
+        is_json = "application/json" in content_type.lower()
+
+        if 400 <= status < 500:
+            code, message = _extract_business_error(response, is_json=is_json)
+            if status == 401 and code == "unknown":
+                code = "unauthorized"
+            raise AltegioBusinessError(code=code, message=message, http_status=status)
+
+        if not (200 <= status < 300):
+            raise AltegioTransportError(f"unexpected status {status}")
+
+        if not is_json:
+            raise AltegioTransportError(
+                f"non-JSON 2xx response (content-type={content_type!r})"
+            )
+        try:
+            body = response.json()
+        except ValueError as e:
+            raise AltegioTransportError(f"invalid JSON in 2xx: {e}") from e
+
+        if isinstance(body, dict):
+            data = body.get("data")
+        elif isinstance(body, list):
+            data = body
+        else:
+            raise AltegioBusinessError(
+                code="malformed_success",
+                message=f"unexpected top-level JSON type: {type(body).__name__}",
+                http_status=status,
+            )
+
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise AltegioBusinessError(
+                code="malformed_success",
+                message=f"'data' must be a list, got {type(data).__name__}",
+                http_status=status,
+            )
+
+        result: list[TimeSlot] = []
+        for idx, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}] must be a mapping, got {type(item).__name__}",
+                    http_status=status,
+                )
+            attrs_raw = item.get("attributes")
+            if not isinstance(attrs_raw, dict):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes missing or not a mapping",
+                    http_status=status,
+                )
+
+            dt_raw = attrs_raw.get("datetime")
+            if not isinstance(dt_raw, str):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes.datetime missing or not a string",
+                    http_status=status,
+                )
+            try:
+                parsed_dt = datetime.fromisoformat(dt_raw)
+            except ValueError as e:
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes.datetime not ISO-8601: {dt_raw!r}",
+                    http_status=status,
+                ) from e
+            if parsed_dt.tzinfo is None:
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes.datetime must be tz-aware: {dt_raw!r}",
+                    http_status=status,
+                )
+            canonical_dt = parsed_dt.astimezone(ALMATY)
+
+            is_bookable = attrs_raw.get("is_bookable")
+            if not isinstance(is_bookable, bool):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes.is_bookable must be bool",
+                    http_status=status,
+                )
+
+            staff_id_raw = attrs_raw.get("staff_id")
+            staff_id: int | None
+            if staff_id_raw is None:
+                staff_id = None
+            elif isinstance(staff_id_raw, bool) or not isinstance(staff_id_raw, int):
+                staff_id = None
+            else:
+                staff_id = staff_id_raw
+
+            try:
+                slot = TimeSlot(dt=canonical_dt, is_bookable=is_bookable, staff_id=staff_id)
+            except ValidationError as e:
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}] invalid: {e.errors()}",
+                    http_status=status,
+                ) from e
+            result.append(slot)
+        return result
 
     @staticmethod
     def _validate_inputs(

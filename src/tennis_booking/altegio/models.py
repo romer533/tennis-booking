@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class TimeSlot(BaseModel):
+    """Распарсенный timeslot из POST /booking/search/timeslots/.
+
+    `dt` — timezone-aware datetime, канонизированный в Asia/Almaty; приходит
+    от Altegio с суффиксом `+05:00`, мы astimezone → ALMATY, чтобы сравнение
+    с locally-built datetime было без сюрпризов.
+
+    `staff_id` — из timeslot.attributes, если присутствует. В response-shape
+    B4, зафиксированном в api-research.md, этого поля нет (сервер возвращает
+    только datetime/time/is_bookable для фильтра по конкретному staff_id в
+    request). Оставляем optional, чтобы не ломаться, если Altegio пришлёт.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    dt: datetime
+    is_bookable: bool
+    staff_id: int | None = None
 
 
 class BookingAppointment(BaseModel):
