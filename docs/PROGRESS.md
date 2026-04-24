@@ -11,21 +11,21 @@
 | Phase 5 — config | [#3](https://github.com/romer533/tennis-booking/pull/3) | pydantic v2 schema (frozen, strict, extra=forbid), YAML loader, cross-validation, PII masking. 163 теста, 97% branch coverage |
 | Phase 3 — Almaty rename | [#4](https://github.com/romer533/tennis-booking/pull/4) | `Atyrau → Almaty` rename, fix leap-year ожиданий под UTC+6 (Kazakhstan TZ unification 2024-03-01) |
 | Phase 3 — clock | [#5](https://github.com/romer533/tennis-booking/pull/5) | `scheduler/clock.py` — async SNTP drift check (raw UDP), `ClockDriftError`, `NTPUnreachableError`, `NTPResponseError`. 33 unit + 1 integration, 100% branch coverage |
+| Phase 2 — altegio | [#6](https://github.com/romer533/tennis-booking/pull/6) | `altegio/` — async httpx client, Bearer auth, `AltegioBusinessError`/`AltegioTransportError`, dry-run, `SecretStr` masking, `_BearerRedactFilter` на httpx+httpcore.*. 98 тестов, 98% branch coverage |
 
-**Тестов в main:** 304 passed + 1 skipped + 1 deselected.
+**Тестов в main:** 403 passed + 1 skipped + 1 deselected.
 
 ## В работе (CR / CI)
 
 | Фаза | Ветка / PR | Статус |
 |------|------------|--------|
-| Phase 2 — `altegio/` | `feature/altegio-client` (cc90319) | CR в процессе. 98 тестов, 98% branch coverage. Будет PR #6 |
+| Phase 4 — `engine/` | [#7](https://github.com/romer533/tennis-booking/pull/7) | CI pending (prior push-run зелёный). `BookingAttempt` state machine, 2 CR рaunds (race priority fix), 55 новых тестов, 97% coverage |
 
 ## Заблокировано
 
 | Что | Кем блокировано | Кто разблокирует |
 |-----|-----------------|------------------|
-| Phase 3 — `scheduler/loop.py` | Phase 2 merge (нужен `AltegioClient.prearm()`) | — |
-| Phase 4 — `engine/attempt.py` | Phase 2 merge | — |
+| Phase 3 — `scheduler/loop.py` | Phase 4 merge (нужен `BookingAttempt.run()`) | — |
 | Phase 6 — observability | Phase 4 | — |
 | Phase 7 — deploy | Phase 6 | — |
 
