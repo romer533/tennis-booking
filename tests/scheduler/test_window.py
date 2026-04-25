@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from tennis_booking.scheduler.window import ALMATY, next_open_window
+from tennis_booking.scheduler.window import ALMATY, LEAD_DAYS, next_open_window
 
 
 def almaty(year: int, month: int, day: int, hour: int = 0, minute: int = 0,
@@ -16,22 +16,30 @@ def utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> date
     return datetime(year, month, day, hour, minute, tzinfo=UTC)
 
 
+class TestEmpiricalConstants:
+    def test_lead_days_is_2_per_empirical_search_dates_api(self) -> None:
+        # Altegio booking horizon = today + 2 calendar days, empirically confirmed
+        # via the search_dates API. Slot D opens on day D-2 at 07:00 Almaty.
+        # Regression guard: bumping this back to 3 makes the bot fire 24h early.
+        assert LEAD_DAYS == 2
+
+
 class TestBasic:
     def test_friday_evening_example(self) -> None:
         slot = almaty(2026, 5, 15, 18, 0)
-        assert next_open_window(slot) == utc(2026, 5, 12, 2, 0)
+        assert next_open_window(slot) == utc(2026, 5, 13, 2, 0)
 
     def test_slot_exactly_at_open_local_time(self) -> None:
         slot = almaty(2026, 5, 15, 7, 0)
-        assert next_open_window(slot) == utc(2026, 5, 12, 2, 0)
+        assert next_open_window(slot) == utc(2026, 5, 13, 2, 0)
 
     def test_slot_one_minute_before_open_local_time(self) -> None:
         slot = almaty(2026, 5, 15, 6, 59)
-        assert next_open_window(slot) == utc(2026, 5, 12, 2, 0)
+        assert next_open_window(slot) == utc(2026, 5, 13, 2, 0)
 
     def test_slot_one_minute_after_open_local_time(self) -> None:
         slot = almaty(2026, 5, 15, 7, 1)
-        assert next_open_window(slot) == utc(2026, 5, 12, 2, 0)
+        assert next_open_window(slot) == utc(2026, 5, 13, 2, 0)
 
 
 class TestDayBoundaries:
@@ -45,63 +53,64 @@ class TestDayBoundaries:
             (0, 0, 0, 1000),
         ],
     )
-    def test_window_is_three_calendar_days_back_at_02_utc(
+    def test_window_is_two_calendar_days_back_at_02_utc(
         self, hour: int, minute: int, second: int, microsecond: int
     ) -> None:
         slot = almaty(2026, 5, 15, hour, minute, second, microsecond)
         result = next_open_window(slot)
-        assert result == utc(2026, 5, 12, 2, 0)
+        assert result == utc(2026, 5, 13, 2, 0)
 
 
 class TestYearBoundary:
     def test_new_year_morning(self) -> None:
         slot = almaty(2027, 1, 1, 0, 30)
-        assert next_open_window(slot) == utc(2026, 12, 29, 2, 0)
+        assert next_open_window(slot) == utc(2026, 12, 30, 2, 0)
 
     def test_new_year_evening(self) -> None:
         slot = almaty(2027, 1, 1, 23, 30)
-        assert next_open_window(slot) == utc(2026, 12, 29, 2, 0)
+        assert next_open_window(slot) == utc(2026, 12, 30, 2, 0)
 
 
 class TestMonthBoundary:
     def test_march_first(self) -> None:
         slot = almaty(2026, 3, 1, 9, 0)
-        assert next_open_window(slot) == utc(2026, 2, 26, 2, 0)
+        assert next_open_window(slot) == utc(2026, 2, 27, 2, 0)
 
     def test_may_first(self) -> None:
         slot = almaty(2026, 5, 1, 18, 0)
-        assert next_open_window(slot) == utc(2026, 4, 28, 2, 0)
+        assert next_open_window(slot) == utc(2026, 4, 29, 2, 0)
 
 
 class TestLeapYear:
     # NB: Kazakhstan unified its timezones on 2024-03-01; before that date
     # Asia/Almaty ran on UTC+6 (vs UTC+5 today). Any window whose LOCAL date
-    # falls before 2024-03-01 therefore converts to UTC at 07:00 − 6h = 01:00.
-    # These expectations are correct for the real Almaty TZ history.
+    # falls before 2024-03-01 therefore converts to UTC at 07:00 - 6h = 01:00.
+    # With LEAD_DAYS=2, slot 2024-03-03 → window local = 2024-03-01 (already
+    # UTC+5), so no more leap-day boundary headaches.
     def test_march_third_in_leap_year(self) -> None:
         slot = almaty(2024, 3, 3, 9, 0)
-        # Window local = 2024-02-29 07:00 Almaty (UTC+6) → 01:00 UTC
-        assert next_open_window(slot) == utc(2024, 2, 29, 1, 0)
+        # Window local = 2024-03-01 07:00 Almaty (UTC+5) → 02:00 UTC
+        assert next_open_window(slot) == utc(2024, 3, 1, 2, 0)
 
     def test_march_first_in_leap_year(self) -> None:
         slot = almaty(2024, 3, 1, 9, 0)
-        # Window local = 2024-02-27 07:00 Almaty (UTC+6) → 01:00 UTC
-        assert next_open_window(slot) == utc(2024, 2, 27, 1, 0)
+        # Window local = 2024-02-28 07:00 Almaty (UTC+6) → 01:00 UTC
+        assert next_open_window(slot) == utc(2024, 2, 28, 1, 0)
 
     def test_march_first_in_non_leap_year(self) -> None:
         slot = almaty(2025, 3, 1, 9, 0)
-        assert next_open_window(slot) == utc(2025, 2, 26, 2, 0)
+        assert next_open_window(slot) == utc(2025, 2, 27, 2, 0)
 
     def test_leap_day_evening(self) -> None:
         slot = almaty(2024, 2, 29, 18, 0)
-        # Window local = 2024-02-26 07:00 Almaty (UTC+6) → 01:00 UTC
-        assert next_open_window(slot) == utc(2024, 2, 26, 1, 0)
+        # Window local = 2024-02-27 07:00 Almaty (UTC+6) → 01:00 UTC
+        assert next_open_window(slot) == utc(2024, 2, 27, 1, 0)
 
 
 class TestEndOfMonth:
     def test_last_day_of_march(self) -> None:
         slot = almaty(2026, 3, 31, 18, 0)
-        assert next_open_window(slot) == utc(2026, 3, 28, 2, 0)
+        assert next_open_window(slot) == utc(2026, 3, 29, 2, 0)
 
 
 WEEKDAY_DATES = [
@@ -120,7 +129,7 @@ class TestAllWeekdays:
     def test_each_weekday(self, year: int, month: int, day: int) -> None:
         slot = almaty(year, month, day, 18, 0)
         result = next_open_window(slot)
-        expected_local = almaty(year, month, day, 7, 0) - timedelta(days=3)
+        expected_local = almaty(year, month, day, 7, 0) - timedelta(days=LEAD_DAYS)
         assert result == expected_local.astimezone(UTC)
 
 
@@ -145,7 +154,7 @@ class TestAllMonths:
     def test_each_month(self, year: int, month: int, day: int) -> None:
         slot = almaty(year, month, day, 18, 0)
         result = next_open_window(slot)
-        expected_local = almaty(year, month, day, 7, 0) - timedelta(days=3)
+        expected_local = almaty(year, month, day, 7, 0) - timedelta(days=LEAD_DAYS)
         assert result == expected_local.astimezone(UTC)
 
 
@@ -168,7 +177,7 @@ class TestReturnShape:
         slot = almaty(2026, 5, 15, 18, 0, 0, 999999)
         result = next_open_window(slot)
         assert result.microsecond == 0
-        assert result == utc(2026, 5, 12, 2, 0)
+        assert result == utc(2026, 5, 13, 2, 0)
 
 
 PROPERTY_DATES = [
@@ -218,13 +227,13 @@ class TestProperties:
         assert result_local.microsecond == 0
 
     @pytest.mark.parametrize(("year", "month", "day", "hour", "minute"), PROPERTY_DATES)
-    def test_calendar_date_difference_in_almaty_is_three_days(
+    def test_calendar_date_difference_in_almaty_is_lead_days(
         self, year: int, month: int, day: int, hour: int, minute: int
     ) -> None:
         slot = almaty(year, month, day, hour, minute)
         result_local_date = next_open_window(slot).astimezone(ALMATY).date()
         diff = (slot.date() - result_local_date).days
-        assert diff == 3
+        assert diff == LEAD_DAYS
 
 
 class TestNegative:
@@ -286,4 +295,4 @@ class TestSystemTzImmunity:
             pytest.skip("TZ env var is not honored by Windows libc / time module")
         monkeypatch.setenv("TZ", "America/New_York")
         slot = almaty(2026, 5, 15, 18, 0)
-        assert next_open_window(slot) == utc(2026, 5, 12, 2, 0)
+        assert next_open_window(slot) == utc(2026, 5, 13, 2, 0)

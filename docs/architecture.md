@@ -36,7 +36,7 @@
 Парсит YAML, валидирует через pydantic. Возвращает иммутабельные `Schedule` (список `BookingRule`) и `Profiles` (словарь `name → Profile`). Не имеет состояния.
 
 ### `scheduler/`
-- **`window.py`** — чистая функция `next_open_window(slot_local_dt) -> datetime`. Реализует правило "T−3 суток в 07:00 Almaty", возвращает UTC. Валидация "окно ещё в будущем" — ответственность `loop.py`, не функции (single responsibility). Полностью покрыта unit-тестами.
+- **`window.py`** — чистая функция `next_open_window(slot_local_dt) -> datetime`. Реализует правило "T−2 суток в 07:00 Almaty", возвращает UTC. Booking horizon Altegio = today + 2 calendar days (эмпирически подтверждено через `search_dates` API). Валидация "окно ещё в будущем" — ответственность `loop.py`, не функции (single responsibility). Полностью покрыта unit-тестами.
 - **`clock.py`** — обёртка с проверкой NTP-дрифта. На старте проверяет offset; падает, если > 50 мс.
 - **`loop.py`** — главный цикл. Раз в сутки в 06:55 Almaty пересчитывает все ближайшие окна на 24 часа вперёд. Для каждого окна `asyncio.create_task` с пробуждением за T−30s.
 
