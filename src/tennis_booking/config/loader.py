@@ -278,6 +278,7 @@ def _resolve(
                 pool_name=pool_name,
                 poll=rule.poll,
                 grace_polling=rule.grace_polling,
+                min_lead_time_hours=rule.min_lead_time_hours,
             )
         )
     return tuple(resolved)

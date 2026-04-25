@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 import structlog
@@ -70,6 +70,12 @@ class AttemptConfig:
     global_deadline_s: float = 10.0
     prearm_lead_s: float = 30.0
     grace_polling: GracePollingConfig | None = None
+    # Skip the fan-out fire if (slot_dt_local − now) < this. Altegio refunds free
+    # cancellations only when more than 2h remain, so booking accidentally inside
+    # that window strands money on a slot we cannot cleanly release. 0.0 disables
+    # the guard (default for tests / legacy code paths). Production sets via
+    # TENNIS_MIN_LEAD_TIME_HOURS env var → SchedulerLoop → AttemptConfig.
+    min_lead_time_hours: float = 0.0
 
     def __post_init__(self) -> None:
         if self.slot_dt_local.tzinfo is None:
@@ -122,6 +128,14 @@ class AttemptConfig:
             )
         if self.prearm_lead_s <= 0:
             raise ValueError(f"prearm_lead_s must be > 0, got {self.prearm_lead_s}")
+        if self.min_lead_time_hours < 0.0:
+            raise ValueError(
+                f"min_lead_time_hours must be >= 0.0, got {self.min_lead_time_hours}"
+            )
+        if self.min_lead_time_hours > 168.0:
+            raise ValueError(
+                f"min_lead_time_hours must be <= 168.0 (1 week), got {self.min_lead_time_hours}"
+            )
 
     @property
     def effective_shots(self) -> int:
@@ -273,6 +287,20 @@ class BookingAttempt:
         if delay > 0:
             await self._clock.sleep(delay)
 
+    def _is_too_close_to_slot(self) -> bool:
+        """True если до slot_dt_local осталось меньше min_lead_time_hours.
+
+        Strict less-than: ровно на границе — fire допустим (Altegio даёт refund при
+        > 2h, а pretty-close-to-2h всё ещё > по строгому сравнению на стороне CRM).
+        Возвращает False, если guard выключен (min_lead_time_hours == 0.0).
+        """
+        threshold_s = self._config.min_lead_time_hours * 3600.0
+        if threshold_s <= 0.0:
+            return False
+        slot_utc = self._config.slot_dt_local.astimezone(UTC)
+        time_to_slot_s = (slot_utc - self._clock.now_utc()).total_seconds()
+        return time_to_slot_s < threshold_s
+
     async def _fire_and_retry(
         self,
         *,
@@ -283,6 +311,26 @@ class BookingAttempt:
         deadline_at_mono: float,
         prearm_ok: bool,
     ) -> AttemptResult:
+        if self._is_too_close_to_slot():
+            self._log.info(
+                "result",
+                status="error",
+                code="too_close_to_slot",
+                min_lead_time_hours=self._config.min_lead_time_hours,
+            )
+            return self._make_result(
+                status="error",
+                booking=None,
+                duplicates=(),
+                fired_at_utc=fired_at_utc,
+                response_at_utc=None,
+                start_mono=start_mono,
+                business_code="too_close_to_slot",
+                transport_cause=None,
+                prearm_ok=prearm_ok,
+                shots_fired=0,
+            )
+
         pending: set[asyncio.Task[BookingResponse]] = set()
         task_idx: dict[asyncio.Task[BookingResponse], int] = {}
         shots_fired = 0
@@ -838,6 +886,26 @@ class BookingAttempt:
           - "error" — config error (unauthorized) → caller exits
           - "lost" — другие исходы (all snv / transport-only / unknown) → caller continues polling
         """
+        if self._is_too_close_to_slot():
+            self._log.info(
+                "grace_result",
+                status="error",
+                code="too_close_to_slot",
+                min_lead_time_hours=self._config.min_lead_time_hours,
+            )
+            return self._make_result(
+                status="error",
+                booking=None,
+                duplicates=tuple(duplicates),
+                fired_at_utc=fired_at_utc,
+                response_at_utc=None,
+                start_mono=start_mono,
+                business_code="too_close_to_slot",
+                transport_cause=None,
+                prearm_ok=prearm_ok,
+                shots_fired=shots_fired_so_far,
+            )
+
         pending: set[asyncio.Task[BookingResponse]] = set()
         task_idx: dict[asyncio.Task[BookingResponse], int] = {}
         local_shots_fired = shots_fired_so_far

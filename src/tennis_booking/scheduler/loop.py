@@ -28,6 +28,7 @@ from tennis_booking.scheduler.clock_errors import (
 from tennis_booking.scheduler.window import next_open_window
 
 __all__ = [
+    "DEFAULT_MIN_LEAD_TIME_HOURS",
     "DEFAULT_NTP_THRESHOLD_MS",
     "LOOKAHEAD_WEEKS",
     "RECOMPUTE_LOCAL_TIME",
@@ -42,6 +43,9 @@ __all__ = [
 RECOMPUTE_LOCAL_TIME = time(6, 55)
 DEFAULT_NTP_THRESHOLD_MS = 50
 SHUTDOWN_TIMEOUT_S = 60.0
+# In-code default is 0.0 (guard disabled) so existing tests / dev runs are not
+# silently broken. Production sets TENNIS_MIN_LEAD_TIME_HOURS=2 in __main__.py.
+DEFAULT_MIN_LEAD_TIME_HOURS = 0.0
 # Sanity bound: if the nearest weekly slot's window is already in the past,
 # walk forward week-by-week looking for the first occurrence whose window is
 # still open in the future. Anything beyond ~4 weeks indicates broken config,
@@ -156,7 +160,12 @@ class SchedulerLoop:
         ntp_checker: NTPChecker | None = None,
         shutdown_timeout_s: float = SHUTDOWN_TIMEOUT_S,
         store: BookingStore | None = None,
+        min_lead_time_hours: float = DEFAULT_MIN_LEAD_TIME_HOURS,
     ) -> None:
+        if min_lead_time_hours < 0.0 or min_lead_time_hours > 168.0:
+            raise ValueError(
+                f"min_lead_time_hours must be in [0.0, 168.0], got {min_lead_time_hours}"
+            )
         self._config = config
         self._client = altegio_client
         self._clock: Clock = clock if clock is not None else SystemClock()
@@ -165,6 +174,7 @@ class SchedulerLoop:
         self._ntp_threshold_ms = ntp_threshold_ms
         self._shutdown_timeout_s = shutdown_timeout_s
         self._store = store
+        self._min_lead_time_hours = min_lead_time_hours
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
@@ -697,6 +707,12 @@ class SchedulerLoop:
 
     def _build_attempt_config(self, scheduled: ScheduledAttempt) -> AttemptConfig:
         booking = scheduled.booking
+        # Per-booking override wins; otherwise app default (env-driven).
+        effective_min_lead = (
+            booking.min_lead_time_hours
+            if booking.min_lead_time_hours is not None
+            else self._min_lead_time_hours
+        )
         return AttemptConfig(
             slot_dt_local=scheduled.slot_dt_local,
             court_ids=booking.court_ids,
@@ -705,6 +721,7 @@ class SchedulerLoop:
             phone=booking.profile.phone,
             profile_name=booking.profile.name,
             email=booking.profile.email,
+            min_lead_time_hours=effective_min_lead,
         )
 
     # --- timing helpers -------------------------------------------------
