@@ -333,9 +333,9 @@ class TestRecomputeLogic:
         make_clock: Callable[..., FakeClock],
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
-        # Tuesday 2026-04-21 06:55 Almaty = 01:55 UTC.
-        # Friday 18:00 Almaty slot opens Tuesday 07:00 → in 5 minutes.
-        clock = make_clock(initial_utc=datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC))
+        # Wednesday 2026-04-22 06:55 Almaty = 01:55 UTC.
+        # Friday 18:00 Almaty slot opens Wednesday 07:00 → in 5 minutes.
+        clock = make_clock(initial_utc=datetime(2026, 4, 22, 1, 55, 0, tzinfo=UTC))
         client = fake_client([])
         cfg = _config(_booking(name="fri", weekday=Weekday.FRIDAY, slot_local_time=time(18, 0)))
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
@@ -345,8 +345,8 @@ class TestRecomputeLogic:
         assert sa.booking.name == "fri"
         # Slot is Friday 2026-04-24 18:00 Almaty (this Friday)
         assert sa.slot_dt_local == datetime(2026, 4, 24, 18, 0, tzinfo=ALMATY)
-        # Window opens Tuesday 2026-04-21 07:00 Almaty = 02:00 UTC
-        assert sa.window_open_utc == datetime(2026, 4, 21, 2, 0, tzinfo=UTC)
+        # Window opens Wednesday 2026-04-22 07:00 Almaty = 02:00 UTC
+        assert sa.window_open_utc == datetime(2026, 4, 22, 2, 0, tzinfo=UTC)
 
     async def test_three_enabled_two_disabled_three_scheduled(
         self,
@@ -373,11 +373,11 @@ class TestRecomputeLogic:
         make_clock: Callable[..., FakeClock],
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
-        # 07:30 Almaty Tuesday = 02:30 UTC. Nearest Friday 18:00 slot's window opened
-        # at Tuesday 07:00 → already 30 min ago → that occurrence is skipped with
+        # 07:30 Almaty Wednesday = 02:30 UTC. Nearest Friday 18:00 slot's window opened
+        # at Wednesday 07:00 → already 30 min ago → that occurrence is skipped with
         # window_passed warn, but the loop must roll forward to the *next* Friday
-        # (2026-05-01) whose window opens 2026-04-28 02:00 UTC — in the future.
-        clock = make_clock(initial_utc=datetime(2026, 4, 21, 2, 30, 0, tzinfo=UTC))
+        # (2026-05-01) whose window opens 2026-04-29 02:00 UTC — in the future.
+        clock = make_clock(initial_utc=datetime(2026, 4, 22, 2, 30, 0, tzinfo=UTC))
         client = fake_client([])
         cfg = _config(_booking(name="fri", weekday=Weekday.FRIDAY, slot_local_time=time(18, 0)))
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
@@ -385,16 +385,16 @@ class TestRecomputeLogic:
         assert len(scheduled) == 1
         sa = scheduled[0]
         assert sa.slot_dt_local == datetime(2026, 5, 1, 18, 0, tzinfo=ALMATY)
-        assert sa.window_open_utc == datetime(2026, 4, 28, 2, 0, tzinfo=UTC)
+        assert sa.window_open_utc == datetime(2026, 4, 29, 2, 0, tzinfo=UTC)
 
-    async def test_friday_18_slot_recompute_tuesday_06_55(
+    async def test_friday_18_slot_recompute_wednesday_06_55(
         self,
         fake_client: Callable[..., FakeAltegioClient],
         make_clock: Callable[..., FakeClock],
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
-        # Tuesday 06:55 Almaty = 01:55 UTC, slot Fri 18:00 → window in 5 min
-        clock = make_clock(initial_utc=datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC))
+        # Wednesday 06:55 Almaty = 01:55 UTC, slot Fri 18:00 → window in 5 min
+        clock = make_clock(initial_utc=datetime(2026, 4, 22, 1, 55, 0, tzinfo=UTC))
         client = fake_client([])
         cfg = _config(_booking(weekday=Weekday.FRIDAY, slot_local_time=time(18, 0)))
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
@@ -409,9 +409,9 @@ class TestRecomputeLogic:
         make_clock: Callable[..., FakeClock],
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
-        # 2026-01-01 was Thursday. Slot Thursday 12:00, "now" is Mon 2025-12-29 06:55
-        # Almaty = Sun 2025-12-29 01:55 UTC. Window: T-3 = Mon 2025-12-29 07:00 Almaty.
-        clock = make_clock(initial_utc=datetime(2025, 12, 29, 1, 55, 0, tzinfo=UTC))
+        # 2026-01-01 was Thursday. Slot Thursday 12:00, "now" is Tue 2025-12-30 06:55
+        # Almaty = Tue 2025-12-30 01:55 UTC. Window: T-2 = Tue 2025-12-30 07:00 Almaty.
+        clock = make_clock(initial_utc=datetime(2025, 12, 30, 1, 55, 0, tzinfo=UTC))
         client = fake_client([])
         cfg = _config(_booking(weekday=Weekday.THURSDAY, slot_local_time=time(12, 0)))
         loop = _build_loop(cfg, clock, client, ntp_checker=ok_ntp_checker)
@@ -419,7 +419,7 @@ class TestRecomputeLogic:
         assert len(scheduled) == 1
         sa = scheduled[0]
         assert sa.slot_dt_local == datetime(2026, 1, 1, 12, 0, tzinfo=ALMATY)
-        assert sa.window_open_utc == datetime(2025, 12, 29, 2, 0, tzinfo=UTC)
+        assert sa.window_open_utc == datetime(2025, 12, 30, 2, 0, tzinfo=UTC)
 
     async def test_two_identical_bookings_two_scheduled(
         self,
@@ -1276,13 +1276,13 @@ class TestTightLoopAtExactRecompute:
         ok_ntp_checker: FakeNTPChecker,
         fake_attempt_factory: Callable[..., Any],
     ) -> None:
-        # 07:30 Almaty Tuesday = 02:30 UTC. The nearest Friday-18:00 booking's
-        # window opens Tue 07:00 — already in the past. The loop must roll
-        # forward to next Friday (2026-05-01) whose window opens 2026-04-28
+        # 07:30 Almaty Wednesday = 02:30 UTC. The nearest Friday-18:00 booking's
+        # window opens Wed 07:00 — already in the past. The loop must roll
+        # forward to next Friday (2026-05-01) whose window opens 2026-04-29
         # 02:00 UTC — well in the future, so a task IS spawned (sleeping toward
         # that prearm). Next scheduled recompute must still be tomorrow 06:55
         # (not today's already-passed 06:55 — that would be a tight loop).
-        now_utc = datetime(2026, 4, 21, 2, 30, 0, tzinfo=UTC)
+        now_utc = datetime(2026, 4, 22, 2, 30, 0, tzinfo=UTC)
         clock = make_clock(initial_utc=now_utc)
         client = fake_client([])
         cfg = _config(
@@ -1544,10 +1544,10 @@ class TestWindowPassedSkipsToNextWeek:
         # Reproduces the prod incident:
         # weekday=sunday, slot_local_time="23:00" Almaty.
         # Service started 2026-04-24 19:17 UTC (Friday evening).
-        # Nearest Sunday = 2026-04-26 23:00 Almaty → window opens 2026-04-23
-        # 07:00 Almaty = 2026-04-23 02:00 UTC → ALREADY PAST (yesterday).
+        # Nearest Sunday = 2026-04-26 23:00 Almaty → window opens 2026-04-24
+        # 07:00 Almaty = 2026-04-24 02:00 UTC → ALREADY PAST (today, 17 h ago).
         # The loop must roll forward to the next Sunday (2026-05-03 23:00 Almaty)
-        # whose window opens 2026-04-30 02:00 UTC.
+        # whose window opens 2026-05-01 02:00 UTC.
         now_utc = datetime(2026, 4, 24, 19, 17, 0, tzinfo=UTC)
         clock = make_clock(initial_utc=now_utc)
         client = fake_client([])
@@ -1566,7 +1566,7 @@ class TestWindowPassedSkipsToNextWeek:
         assert len(scheduled) == 1
         sa = scheduled[0]
         assert sa.slot_dt_local == datetime(2026, 5, 3, 23, 0, tzinfo=ALMATY)
-        assert sa.window_open_utc == datetime(2026, 4, 30, 2, 0, tzinfo=UTC)
+        assert sa.window_open_utc == datetime(2026, 5, 1, 2, 0, tzinfo=UTC)
 
         # window_passed must have been logged exactly once for the skipped
         # nearest occurrence, and recompute_done must report scheduled=1.
@@ -1590,8 +1590,8 @@ class TestWindowPassedSkipsToNextWeek:
         ok_ntp_checker: FakeNTPChecker,
     ) -> None:
         # 2026-04-20 00:00 UTC = 05:00 Almaty Monday. Nearest Sunday 23:00 slot
-        # = 2026-04-26 23:00 Almaty → window opens 2026-04-23 07:00 Almaty
-        # = 2026-04-23 02:00 UTC → still in the future. Use the nearest occurrence.
+        # = 2026-04-26 23:00 Almaty → window opens 2026-04-24 07:00 Almaty
+        # = 2026-04-24 02:00 UTC → still in the future. Use the nearest occurrence.
         now_utc = datetime(2026, 4, 20, 0, 0, 0, tzinfo=UTC)
         clock = make_clock(initial_utc=now_utc)
         client = fake_client([])
@@ -1610,7 +1610,7 @@ class TestWindowPassedSkipsToNextWeek:
         assert len(scheduled) == 1
         sa = scheduled[0]
         assert sa.slot_dt_local == datetime(2026, 4, 26, 23, 0, tzinfo=ALMATY)
-        assert sa.window_open_utc == datetime(2026, 4, 23, 2, 0, tzinfo=UTC)
+        assert sa.window_open_utc == datetime(2026, 4, 24, 2, 0, tzinfo=UTC)
         # No window_passed warns when nearest occurrence is already valid.
         assert recorder.by_event("window_passed") == []
 
