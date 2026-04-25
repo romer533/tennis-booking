@@ -277,6 +277,7 @@ def _resolve(
                 enabled=rule.enabled,
                 pool_name=pool_name,
                 poll=rule.poll,
+                grace_polling=rule.grace_polling,
             )
         )
     return tuple(resolved)

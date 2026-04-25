@@ -532,22 +532,50 @@ class AltegioClient:
         raise AltegioTransportError(f"unexpected status {status}")
 
 
+_TEXT_CODE_MAPPING: tuple[tuple[str, str], ...] = (
+    ("service is not available", "service_not_available"),
+    ("unauthorized", "unauthorized"),
+)
+
+
+def _derive_code_from_text(text: str) -> str:
+    """Подставляет business code из подстроки сообщения (case-insensitive).
+
+    Altegio в новом shape (incident 24.04 02:00 UTC) возвращает только текст,
+    без отдельного `code`. Маппинг — узкий: только зафиксированные строки.
+    """
+    lowered = text.lower()
+    for needle, code in _TEXT_CODE_MAPPING:
+        if needle in lowered:
+            return code
+    return "unknown"
+
+
 def _extract_business_error(response: httpx.Response, *, is_json: bool) -> tuple[str, str]:
     """Парсит Altegio-style ошибку. Всегда возвращает (code, message).
 
-    Altegio возвращает два shape:
-      - {"meta": {"errors": [{"code": "...", "message": "..."}]}}
-      - {"meta": {"message": "..."}, "success": false}
-    Для не-JSON / пустого — ("unknown", <raw truncated>|"<empty>").
+    Altegio возвращает несколько shape (по убыванию приоритета):
+      1. {"meta": {"errors": [{"code": "...", "message": "..."}]}} — старый array shape
+      2. {"errors": {"code": <int|str>, "message": "..."}} — новый dict shape (24.04 incident)
+      3. {"meta": {"message": "..."}, "success": false} — meta-only fallback
+      4. Else → ("unknown", raw truncated body), WARN-лог.
+
+    Для shapes 2 и 3 code derived через text mapping (см. `_derive_code_from_text`).
     """
     if not is_json:
         raw = response.text or "<empty>"
+        _logger.warning(
+            "altegio_unknown_error_body content_type=%r body=%r",
+            response.headers.get("content-type"),
+            _truncate(raw),
+        )
         return "unknown", _truncate(raw)
 
     try:
         body: Any = response.json()
     except ValueError:
         raw = response.text or "<empty>"
+        _logger.warning("altegio_unknown_error_body body=%r", _truncate(raw))
         return "unknown", _truncate(raw)
 
     if isinstance(body, dict):
@@ -560,11 +588,20 @@ def _extract_business_error(response: httpx.Response, *, is_json: bool) -> tuple
                     code = str(first.get("code") or "unknown")
                     message = str(first.get("message") or "")
                     return code, message
+
+        top_errors = body.get("errors")
+        if isinstance(top_errors, dict):
+            message_raw = top_errors.get("message")
+            if isinstance(message_raw, str) and message_raw:
+                return _derive_code_from_text(message_raw), message_raw
+
+        if isinstance(meta, dict):
             top_message = meta.get("message")
             if isinstance(top_message, str) and top_message:
-                return "unknown", top_message
+                return _derive_code_from_text(top_message), top_message
 
     raw = response.text or "<empty>"
+    _logger.warning("altegio_unknown_error_body body=%r", _truncate(raw))
     return "unknown", _truncate(raw)
 
 

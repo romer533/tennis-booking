@@ -13,9 +13,11 @@ from tennis_booking.altegio import (
     AltegioClient,
     AltegioTransportError,
     BookingResponse,
+    TimeSlot,
 )
 from tennis_booking.common.clock import Clock
 from tennis_booking.common.tz import ALMATY
+from tennis_booking.config.schema import GracePollingConfig
 from tennis_booking.persistence import BookedSlot, BookingStore
 from tennis_booking.persistence.models import PROFILE_NAME_RE, SCHEMA_VERSION
 
@@ -41,6 +43,9 @@ _PREARM_TAIL_GUARD_S = 0.1
 _PER_SHOT_TAIL_GUARD_S = 0.1
 _PER_SHOT_MIN_TIMEOUT_S = 0.2
 
+_GRACE_SEARCH_TIMEOUT_S = 5.0
+_GRACE_PER_SHOT_TIMEOUT_S = 5.0
+
 
 @dataclass(frozen=True)
 class AttemptConfig:
@@ -64,6 +69,7 @@ class AttemptConfig:
     not_open_deadline_s: float = 5.0
     global_deadline_s: float = 10.0
     prearm_lead_s: float = 30.0
+    grace_polling: GracePollingConfig | None = None
 
     def __post_init__(self) -> None:
         if self.slot_dt_local.tzinfo is None:
@@ -231,6 +237,7 @@ class BookingAttempt:
         return await self._fire_and_retry(
             fired_at_utc=fired_at_utc,
             start_mono=start_mono,
+            window_at_mono=window_at_mono,
             not_open_deadline_mono=not_open_deadline_mono,
             deadline_at_mono=deadline_at_mono,
             prearm_ok=prearm_ok,
@@ -271,6 +278,7 @@ class BookingAttempt:
         *,
         fired_at_utc: datetime,
         start_mono: float,
+        window_at_mono: float,
         not_open_deadline_mono: float,
         deadline_at_mono: float,
         prearm_ok: bool,
@@ -493,6 +501,20 @@ class BookingAttempt:
                     if now_mono > not_open_deadline_mono:
                         if not transport_retry_idxs and not pending:
                             await self._cancel_all(pending)
+                            if self._config.grace_polling is not None:
+                                grace_deadline_mono = (
+                                    window_at_mono + self._config.grace_polling.period_s
+                                )
+                                return await self._grace_phase(
+                                    grace_deadline_at_mono=grace_deadline_mono,
+                                    fired_at_utc=fired_at_utc,
+                                    start_mono=start_mono,
+                                    not_open_code_seen=not_open_code_seen,
+                                    duplicates=duplicates,
+                                    response_at_utc=response_at_utc,
+                                    prearm_ok=prearm_ok,
+                                    shots_fired=shots_fired,
+                                )
                             self._log.info(
                                 "result",
                                 status="timeout",
@@ -661,6 +683,323 @@ class BookingAttempt:
             if isinstance(res, BookingResponse):
                 duplicates.append(res)
         pending.clear()
+
+    # --- grace mode -----------------------------------------------------
+
+    async def _grace_phase(
+        self,
+        *,
+        grace_deadline_at_mono: float,
+        fired_at_utc: datetime,
+        start_mono: float,
+        not_open_code_seen: str | None,
+        duplicates: list[BookingResponse],
+        response_at_utc: datetime | None,
+        prearm_ok: bool,
+        shots_fired: int,
+    ) -> AttemptResult:
+        """Polls search/timeslots каждые grace_polling.interval_s до grace_deadline.
+
+        На первый bookable matched slot — fan-out create_booking на ВСЕ court_ids.
+        Win → return won (phase="window"). Config error → return error.
+        Lost / transport-only / все snv → продолжаем polling.
+        """
+        grace = self._config.grace_polling
+        assert grace is not None  # invariant: caller already checked
+        self._log.info(
+            "grace_started",
+            grace_period_s=grace.period_s,
+            grace_interval_s=grace.interval_s,
+            not_open_code_seen=not_open_code_seen,
+        )
+
+        target_almaty = (
+            self._config.slot_dt_local
+            if self._config.slot_dt_local.tzinfo is ALMATY
+            else self._config.slot_dt_local.astimezone(ALMATY)
+        )
+        target_date = target_almaty.date()
+        staff_ids = list(self._config.court_ids)
+
+        local_shots_fired = shots_fired
+        local_response_at_utc = response_at_utc
+
+        while True:
+            await self._clock.sleep(grace.interval_s)
+
+            now_mono = self._clock.monotonic()
+            if now_mono > grace_deadline_at_mono:
+                self._log.info("grace_period_exhausted")
+                return self._make_result(
+                    status="timeout",
+                    booking=None,
+                    duplicates=tuple(duplicates),
+                    fired_at_utc=fired_at_utc,
+                    response_at_utc=local_response_at_utc,
+                    start_mono=start_mono,
+                    business_code="grace_period_exhausted",
+                    transport_cause=None,
+                    prearm_ok=prearm_ok,
+                    shots_fired=local_shots_fired,
+                )
+
+            try:
+                slots = await self._client.search_timeslots(
+                    date_local=target_date,
+                    staff_ids=staff_ids,
+                    timeout_s=_GRACE_SEARCH_TIMEOUT_S,
+                )
+            except AltegioBusinessError as e:
+                if e.code in CONFIG_ERROR_CODES:
+                    self._log.error(
+                        "grace_search_config_err",
+                        code=e.code,
+                        http_status=e.http_status,
+                    )
+                    return self._make_result(
+                        status="error",
+                        booking=None,
+                        duplicates=tuple(duplicates),
+                        fired_at_utc=fired_at_utc,
+                        response_at_utc=local_response_at_utc,
+                        start_mono=start_mono,
+                        business_code=e.code,
+                        transport_cause=None,
+                        prearm_ok=prearm_ok,
+                        shots_fired=local_shots_fired,
+                    )
+                self._log.warning(
+                    "grace_search_business_err",
+                    code=e.code,
+                    http_status=e.http_status,
+                )
+                continue
+            except AltegioTransportError as e:
+                self._log.warning("grace_search_transport_err", cause=e.cause)
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — never let grace crash on unexpected
+                self._log.warning(
+                    "grace_search_unknown_err",
+                    exc_type=type(e).__name__,
+                    error=str(e),
+                )
+                continue
+
+            if not self._has_bookable(slots, target_almaty):
+                self._log.info("grace_search_no_match", slot_count=len(slots))
+                continue
+
+            self._log.info("grace_search_match_fire")
+            fire_result = await self._fire_shots_grace(
+                fired_at_utc=fired_at_utc,
+                start_mono=start_mono,
+                duplicates=duplicates,
+                prearm_ok=prearm_ok,
+                shots_fired_so_far=local_shots_fired,
+            )
+            local_shots_fired = fire_result.shots_fired
+            if fire_result.response_at_utc is not None:
+                local_response_at_utc = fire_result.response_at_utc
+
+            if fire_result.status == "won":
+                return fire_result
+            if fire_result.status == "error":
+                return fire_result
+            # status == "lost" with all-snv OR transport-only: continue polling.
+            continue
+
+    def _has_bookable(self, slots: list[TimeSlot], target_almaty: datetime) -> bool:
+        """True если хотя бы один slot матчит наш slot_dt_local и is_bookable."""
+        for slot in slots:
+            if not slot.is_bookable:
+                continue
+            if slot.dt.astimezone(ALMATY) != target_almaty:
+                continue
+            if slot.staff_id is not None and slot.staff_id not in self._config.court_ids:
+                continue
+            return True
+        return False
+
+    async def _fire_shots_grace(
+        self,
+        *,
+        fired_at_utc: datetime,
+        start_mono: float,
+        duplicates: list[BookingResponse],
+        prearm_ok: bool,
+        shots_fired_so_far: int,
+    ) -> AttemptResult:
+        """Fan-out create_booking на ВСЕ court_ids с per-shot timeout 5s.
+
+        Возвращает AttemptResult с status:
+          - "won" — хотя бы один shot succeeded
+          - "error" — config error (unauthorized) → caller exits
+          - "lost" — другие исходы (all snv / transport-only / unknown) → caller continues polling
+        """
+        pending: set[asyncio.Task[BookingResponse]] = set()
+        task_idx: dict[asyncio.Task[BookingResponse], int] = {}
+        local_shots_fired = shots_fired_so_far
+        local_response_at_utc: datetime | None = None
+
+        for idx, court_id in enumerate(self._config.court_ids):
+            task = asyncio.create_task(
+                self._shot(idx, court_id, _GRACE_PER_SHOT_TIMEOUT_S),
+                name=f"grace-shot-{idx}-court-{court_id}",
+            )
+            pending.add(task)
+            task_idx[task] = idx
+            local_shots_fired += 1
+
+        try:
+            won_booking: BookingResponse | None = None
+            won_court_id: int | None = None
+            config_err_code: str | None = None
+            transport_cause_seen: str | None = None
+            unknown_code: str | None = None
+            slot_taken_code: str | None = None
+            not_open_seen: bool = False
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    idx = task_idx.pop(task)
+                    if local_response_at_utc is None:
+                        local_response_at_utc = self._clock.now_utc()
+
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is None:
+                        booking = task.result()
+                        self._log.info(
+                            "grace_response",
+                            idx=idx,
+                            status="success",
+                            record_id=booking.record_id,
+                        )
+                        if won_booking is None:
+                            won_booking = booking
+                            won_court_id = self._config.court_ids[idx]
+                        else:
+                            duplicates.append(booking)
+                        continue
+
+                    if isinstance(exc, AltegioBusinessError):
+                        self._log.info(
+                            "grace_response",
+                            idx=idx,
+                            status="business",
+                            code=exc.code,
+                            http_status=exc.http_status,
+                        )
+                        if exc.code in CONFIG_ERROR_CODES:
+                            if config_err_code is None:
+                                config_err_code = exc.code
+                        elif exc.code in NOT_OPEN_CODES:
+                            not_open_seen = True
+                        elif exc.code in SLOT_TAKEN_CODES:
+                            if slot_taken_code is None:
+                                slot_taken_code = exc.code
+                        else:
+                            if unknown_code is None:
+                                unknown_code = exc.code
+                        continue
+
+                    if isinstance(exc, AltegioTransportError):
+                        self._log.info(
+                            "grace_response",
+                            idx=idx,
+                            status="transport",
+                            cause=exc.cause,
+                        )
+                        if transport_cause_seen is None:
+                            transport_cause_seen = exc.cause
+                        continue
+
+                    if isinstance(exc, asyncio.CancelledError):
+                        continue
+
+                    self._log.warning(
+                        "grace_response",
+                        idx=idx,
+                        status="unknown_exception",
+                        exc_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    if transport_cause_seen is None:
+                        transport_cause_seen = type(exc).__name__
+
+            if won_booking is not None:
+                assert won_court_id is not None
+                await self._persist_win(won_booking, won_court_id, "window")
+                self._log.info(
+                    "grace_result",
+                    status="won",
+                    record_id=won_booking.record_id,
+                    duplicates=len(duplicates),
+                )
+                return self._make_result(
+                    status="won",
+                    booking=won_booking,
+                    duplicates=tuple(duplicates),
+                    fired_at_utc=fired_at_utc,
+                    response_at_utc=local_response_at_utc,
+                    start_mono=start_mono,
+                    business_code=None,
+                    transport_cause=None,
+                    prearm_ok=prearm_ok,
+                    shots_fired=local_shots_fired,
+                )
+
+            if config_err_code is not None:
+                self._log.error("grace_result", status="error", code=config_err_code)
+                return self._make_result(
+                    status="error",
+                    booking=None,
+                    duplicates=tuple(duplicates),
+                    fired_at_utc=fired_at_utc,
+                    response_at_utc=local_response_at_utc,
+                    start_mono=start_mono,
+                    business_code=config_err_code,
+                    transport_cause=None,
+                    prearm_ok=prearm_ok,
+                    shots_fired=local_shots_fired,
+                )
+
+            # Anything else (slot_taken / unknown / not_open / transport-only): tell caller
+            # to keep polling. business_code preserved for observability; status="lost" so
+            # outer grace loop continues.
+            preserved_code = slot_taken_code or unknown_code
+            if preserved_code is None and not_open_seen:
+                preserved_code = "service_not_available"
+            self._log.info(
+                "grace_result",
+                status="lost",
+                business_code=preserved_code,
+                transport_cause=transport_cause_seen,
+            )
+            return self._make_result(
+                status="lost",
+                booking=None,
+                duplicates=tuple(duplicates),
+                fired_at_utc=fired_at_utc,
+                response_at_utc=local_response_at_utc,
+                start_mono=start_mono,
+                business_code=preserved_code,
+                transport_cause=transport_cause_seen,
+                prearm_ok=prearm_ok,
+                shots_fired=local_shots_fired,
+            )
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     def _make_result(
         self,
