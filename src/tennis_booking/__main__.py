@@ -33,6 +33,10 @@ DEFAULT_CONFIG_DIR = Path("/etc/tennis-booking")
 DEFAULT_LOG_DIR = Path("/var/log/tennis-booking")
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_BOOKINGS_FILE = Path("/app/data/bookings.jsonl")
+# In-code default is 0.0 (guard disabled) — production sets this to 2.0 via
+# TENNIS_MIN_LEAD_TIME_HOURS in the systemd EnvironmentFile.
+DEFAULT_MIN_LEAD_TIME_HOURS = 0.0
+MAX_MIN_LEAD_TIME_HOURS = 168.0
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -83,6 +87,40 @@ def _resolve_log_dir() -> Path:
     if raw and raw.strip():
         return Path(raw.strip())
     return DEFAULT_LOG_DIR
+
+
+def _parse_min_lead_time_hours(env_value: str | None) -> float:
+    """TENNIS_MIN_LEAD_TIME_HOURS — fail-fast at startup on invalid values.
+
+    Empty / unset → DEFAULT_MIN_LEAD_TIME_HOURS (in-code default 0.0). Anything
+    else must parse as a finite float in [0.0, MAX_MIN_LEAD_TIME_HOURS]; otherwise
+    raise ValueError so the service refuses to start with a typo'd config.
+    """
+    if env_value is None:
+        return DEFAULT_MIN_LEAD_TIME_HOURS
+    stripped = env_value.strip()
+    if not stripped:
+        return DEFAULT_MIN_LEAD_TIME_HOURS
+    try:
+        value = float(stripped)
+    except ValueError as e:
+        raise ValueError(
+            f"TENNIS_MIN_LEAD_TIME_HOURS must be a number, got {env_value!r}"
+        ) from e
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+        raise ValueError(
+            f"TENNIS_MIN_LEAD_TIME_HOURS must be a finite number, got {env_value!r}"
+        )
+    if value < 0.0:
+        raise ValueError(
+            f"TENNIS_MIN_LEAD_TIME_HOURS must be >= 0.0, got {value}"
+        )
+    if value > MAX_MIN_LEAD_TIME_HOURS:
+        raise ValueError(
+            f"TENNIS_MIN_LEAD_TIME_HOURS must be <= {MAX_MIN_LEAD_TIME_HOURS} "
+            f"(1 week), got {value}"
+        )
+    return value
 
 
 def _parse_ntp_required(env_value: str | None) -> bool:
@@ -162,6 +200,19 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "— will not fail-fast on NTP errors"
         )
 
+    try:
+        min_lead_time_hours = _parse_min_lead_time_hours(
+            os.environ.get("TENNIS_MIN_LEAD_TIME_HOURS")
+        )
+    except ValueError as e:
+        logger.error("min_lead_time_hours_invalid: %s", e)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    logger.info(
+        "min_lead_time_hours=%s (0.0 = guard disabled; per-booking override may apply)",
+        min_lead_time_hours,
+    )
+
     store_path = _resolve_store_path()
     try:
         store = FileBookingStore(store_path)
@@ -183,6 +234,7 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             SystemClock(),
             ntp_required=ntp_required,
             store=store,
+            min_lead_time_hours=min_lead_time_hours,
         )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)

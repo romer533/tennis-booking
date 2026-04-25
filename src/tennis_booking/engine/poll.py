@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import structlog
 
@@ -306,7 +306,38 @@ class PollAttempt:
             return list(self._config.court_ids)
         return None
 
+    def _is_too_close_to_slot(self) -> bool:
+        """True если до slot_dt_local осталось меньше min_lead_time_hours.
+
+        Strict less-than: ровно на границе fire допустим. См. attempt.py docstring.
+        """
+        threshold_s = self._config.min_lead_time_hours * 3600.0
+        if threshold_s <= 0.0:
+            return False
+        slot_utc = self._config.slot_dt_local.astimezone(UTC)
+        time_to_slot_s = (slot_utc - self._clock.now_utc()).total_seconds()
+        return time_to_slot_s < threshold_s
+
     async def _fire_shots(self, *, start_mono: float) -> AttemptResult:
+        if self._is_too_close_to_slot():
+            self._log.info(
+                "poll_result",
+                status="error",
+                code="too_close_to_slot",
+                min_lead_time_hours=self._config.min_lead_time_hours,
+            )
+            return self._make_result(
+                status="error",
+                booking=None,
+                duplicates=(),
+                fired_at_utc=None,
+                response_at_utc=None,
+                start_mono=start_mono,
+                business_code="too_close_to_slot",
+                transport_cause=None,
+                shots_fired=0,
+            )
+
         fired_at_utc = self._clock.now_utc()
         self._log.info("poll_fire_at", fired_at_utc=fired_at_utc.isoformat())
 

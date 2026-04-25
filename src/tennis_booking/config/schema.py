@@ -166,6 +166,10 @@ class BookingRule(BaseModel):
     enabled: bool = True
     poll: PollConfig | None = None
     grace_polling: GracePollingConfig | None = None
+    # None → use the app-level default (env TENNIS_MIN_LEAD_TIME_HOURS, fallback 0.0).
+    # 0.0 explicitly disables the guard for this booking. Upper bound 168h (1 week)
+    # is a sanity cap — bigger values almost certainly mean a YAML typo.
+    min_lead_time_hours: float | None = Field(default=None, ge=0.0, le=168.0)
 
     @field_validator("name")
     @classmethod
@@ -267,6 +271,7 @@ class ResolvedBooking(BaseModel):
     pool_name: str | None = None
     poll: PollConfig | None = None
     grace_polling: GracePollingConfig | None = None
+    min_lead_time_hours: float | None = Field(default=None, ge=0.0, le=168.0)
 
     @field_validator("court_ids", mode="before")
     @classmethod
