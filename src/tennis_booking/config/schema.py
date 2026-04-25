@@ -103,6 +103,20 @@ class PollConfig(BaseModel):
     start_offset_days: int = Field(ge=1, le=30)
 
 
+class GracePollingConfig(BaseModel):
+    """Параметры grace-режима для late admin opens.
+
+    После того как обычный T−0..T+10s flow исчерпан и ВСЕ shots вернули
+    service_not_available, engine входит в grace mode: периодически
+    опрашивает search/timeslots и стреляет на первый bookable.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    period_s: int = Field(ge=60, le=1800)
+    interval_s: int = Field(ge=10, le=300)
+
+
 class CourtPool(BaseModel):
     """Группа кортов одного service_id. Одна booking-запись с court_pool: <name>
     будет fan-out'иться параллельными shots на все courts в пуле; first-success
@@ -151,6 +165,7 @@ class BookingRule(BaseModel):
     profile: str
     enabled: bool = True
     poll: PollConfig | None = None
+    grace_polling: GracePollingConfig | None = None
 
     @field_validator("name")
     @classmethod
@@ -251,6 +266,7 @@ class ResolvedBooking(BaseModel):
     enabled: bool
     pool_name: str | None = None
     poll: PollConfig | None = None
+    grace_polling: GracePollingConfig | None = None
 
     @field_validator("court_ids", mode="before")
     @classmethod

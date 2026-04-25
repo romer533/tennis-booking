@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from tennis_booking.altegio import (
     AltegioConfig,
     BookingResponse,
+    TimeSlot,
 )
 from tennis_booking.altegio.client import AltegioClient
 from tennis_booking.common.clock import Clock
@@ -67,22 +68,35 @@ class FakeClock:
 
 
 SideEffect = BookingResponse | BaseException | Callable[[], Awaitable[BookingResponse]]
+SearchEffect = (
+    list[TimeSlot]
+    | BaseException
+    | Callable[[], Awaitable[list[TimeSlot]]]
+)
 
 
 class FakeAltegioClient:
-    """FIFO script of create_booking responses. One call = one entry."""
+    """FIFO script of create_booking responses. One call = one entry.
+
+    Дополнительно поддерживает search_timeslots — отдельный FIFO список
+    эффектов для grace mode тестов.
+    """
 
     def __init__(
         self,
         side_effects: list[SideEffect] | None = None,
         config: AltegioConfig | None = None,
         prearm_effect: BaseException | Callable[[], Awaitable[None]] | None = None,
+        search_effects: list[SearchEffect] | None = None,
     ) -> None:
         self._side_effects: list[SideEffect] = list(side_effects or [])
         self._config = config or _default_config()
         self._prearm_effect = prearm_effect
+        self._search_effects: list[SearchEffect] = list(search_effects or [])
+        self._default_side_effect: SideEffect | None = None
         self.create_booking_calls: list[dict[str, Any]] = []
         self.prearm_calls: int = 0
+        self.search_timeslots_calls: list[dict[str, Any]] = []
 
     @property
     def config(self) -> AltegioConfig:
@@ -125,9 +139,46 @@ class FakeAltegioClient:
         }
         self.create_booking_calls.append(call)
         if not self._side_effects:
-            raise AssertionError("FakeAltegioClient has no more scripted responses")
-        effect = self._side_effects.pop(0)
+            if self._default_side_effect is not None:
+                effect: SideEffect = self._default_side_effect
+            else:
+                raise AssertionError("FakeAltegioClient has no more scripted responses")
+        else:
+            effect = self._side_effects.pop(0)
         if isinstance(effect, BookingResponse):
+            await asyncio.sleep(0)
+            return effect
+        if isinstance(effect, BaseException):
+            await asyncio.sleep(0)
+            raise effect
+        return await effect()
+
+    def set_default_side_effect(self, effect: SideEffect | None) -> None:
+        """Sticky default — used after explicit script is exhausted. Set None to disable."""
+        self._default_side_effect = effect
+
+    def add_search(self, *effects: SearchEffect) -> None:
+        self._search_effects.extend(effects)
+
+    async def search_timeslots(
+        self,
+        *,
+        date_local: Any,
+        staff_ids: list[int],
+        timeout_s: float | None = None,
+    ) -> list[TimeSlot]:
+        call = {
+            "date_local": date_local,
+            "staff_ids": staff_ids,
+            "timeout_s": timeout_s,
+        }
+        self.search_timeslots_calls.append(call)
+        if not self._search_effects:
+            raise AssertionError(
+                "FakeAltegioClient has no more scripted search_timeslots responses"
+            )
+        effect = self._search_effects.pop(0)
+        if isinstance(effect, list):
             await asyncio.sleep(0)
             return effect
         if isinstance(effect, BaseException):
@@ -174,11 +225,13 @@ def fake_client() -> Callable[..., FakeAltegioClient]:
         *,
         dry_run: bool = False,
         prearm_effect: BaseException | Callable[[], Awaitable[None]] | None = None,
+        search_effects: list[SearchEffect] | None = None,
     ) -> FakeAltegioClient:
         return FakeAltegioClient(
             side_effects=side_effects,
             config=_default_config(dry_run=dry_run),
             prearm_effect=prearm_effect,
+            search_effects=search_effects,
         )
 
     return _make
@@ -243,6 +296,7 @@ __all__ = [
     "SERVICE_ID",
     "SLOT",
     "STAFF_ID",
+    "SearchEffect",
     "SideEffect",
     "as_altegio_client",
     "as_clock",

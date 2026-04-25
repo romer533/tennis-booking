@@ -254,6 +254,37 @@ async def test_negative_staff_id_rejected() -> None:
 
 
 @respx.mock
+async def test_4xx_legacy_meta_errors_array_regression() -> None:
+    """P2 regression: existing meta.errors[] shape must keep working — parser
+    update must NOT break the old contract."""
+    respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
+        return_value=httpx.Response(
+            422,
+            json={
+                "meta": {
+                    "errors": [
+                        {"code": "any_legacy_code", "message": "legacy text"}
+                    ]
+                }
+            },
+            headers={"content-type": "application/json"},
+        )
+    )
+    async with AltegioClient(_make_config()) as client:
+        with pytest.raises(AltegioBusinessError) as ei:
+            await client.create_booking(
+                service_id=SERVICE_ID,
+                staff_id=STAFF_ID,
+                slot_dt_local=SLOT,
+                fullname="X",
+                phone="7",
+            )
+    assert ei.value.code == "any_legacy_code"
+    assert ei.value.message == "legacy text"
+    assert ei.value.http_status == 422
+
+
+@respx.mock
 async def test_4xx_with_meta_errors_business_error() -> None:
     # TODO(provocation #1/#2): verify actual Altegio 4xx shape after manual provocation.
     # Current shape {"meta":{"errors":[...]}} is hypothetical, based on general Altegio API conventions.
