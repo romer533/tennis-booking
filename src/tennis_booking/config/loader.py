@@ -223,10 +223,11 @@ def _resolve(
     profiles: dict[str, Profile],
     pools: dict[str, CourtPool],
 ) -> tuple[ResolvedBooking, ...]:
-    # Cross-validation: per-court dedup is done over EXPANDED court_ids, so a
-    # legacy single-court booking conflicts with a pool-booking that contains
-    # the same court at the same (weekday, slot).
-    court_owner: dict[tuple[str, str, int], str] = {}
+    # Cross-validation: per-court dedup is done over EXPANDED court_ids and is
+    # scoped per profile — different profiles legitimately compete for the same
+    # slot (whoever fires first wins). Same profile + same court + same slot is
+    # a real duplicate of one logical booking.
+    court_owner: dict[tuple[str, str, int, str], str] = {}
     resolved: list[ResolvedBooking] = []
 
     for rule in rules:
@@ -256,12 +257,13 @@ def _resolve(
         weekday_s = rule.weekday.value
         slot_s = rule.slot_local_time.strftime("%H:%M")
         for cid in court_ids:
-            slot_key = (weekday_s, slot_s, cid)
+            slot_key = (weekday_s, slot_s, cid, rule.profile)
             existing = court_owner.get(slot_key)
             if existing is not None:
                 raise ConfigError(
                     f"duplicate booking slot ({weekday_s} {slot_s} "
-                    f"court={cid}): {existing!r} and {rule.name!r}"
+                    f"court={cid} profile={rule.profile!r}): "
+                    f"{existing!r} and {rule.name!r}"
                 )
             court_owner[slot_key] = rule.name
 

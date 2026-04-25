@@ -15,6 +15,25 @@ profiles:
     phone: "+77001234567"
 """
 
+MULTI_PROFILES = """\
+profiles:
+  roman:
+    full_name: "R G"
+    phone: "+77001234567"
+  askar:
+    full_name: "A K"
+    phone: "+77002345678"
+  daulet:
+    full_name: "D N"
+    phone: "+77003456789"
+"""
+
+
+def write_multi(tmp_path: Path, schedule: str) -> Path:
+    (tmp_path / "profiles.yaml").write_text(MULTI_PROFILES, encoding="utf-8")
+    (tmp_path / "schedule.yaml").write_text(schedule, encoding="utf-8")
+    return tmp_path
+
 
 def write(tmp_path: Path, schedule: str) -> Path:
     (tmp_path / "profiles.yaml").write_text(GOOD_PROFILES, encoding="utf-8")
@@ -207,3 +226,154 @@ bookings:
         write(tmp_path, schedule)
         with pytest.raises(ConfigError, match="duplicate"):
             load_app_config(tmp_path)
+
+
+class TestDedupAcrossProfiles:
+    """Cross-profile dedup: different profiles legitimately compete for the
+    same court+slot (whoever fires first wins). Same profile + same slot is
+    still a real duplicate."""
+
+    def test_two_bookings_same_pool_different_profiles_ok(
+        self, tmp_path: Path
+    ) -> None:
+        schedule = """\
+court_pools:
+  indoor:
+    service_id: 7849893
+    court_ids: [100, 101]
+bookings:
+  - name: "roman_mon20"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: roman
+  - name: "askar_mon20"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: askar
+"""
+        write_multi(tmp_path, schedule)
+        cfg = load_app_config(tmp_path)
+        assert len(cfg.bookings) == 2
+        names = {b.name for b in cfg.bookings}
+        assert names == {"roman_mon20", "askar_mon20"}
+
+    def test_three_bookings_same_pool_different_profiles_ok(
+        self, tmp_path: Path
+    ) -> None:
+        schedule = """\
+court_pools:
+  indoor:
+    service_id: 7849893
+    court_ids: [100, 101]
+bookings:
+  - name: "roman_mon20"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: roman
+  - name: "askar_mon20"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: askar
+  - name: "daulet_mon20"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: daulet
+"""
+        write_multi(tmp_path, schedule)
+        cfg = load_app_config(tmp_path)
+        assert len(cfg.bookings) == 3
+        profiles_used = {b.profile.name for b in cfg.bookings}
+        assert profiles_used == {"roman", "askar", "daulet"}
+
+    def test_two_bookings_same_pool_same_profile_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        schedule = """\
+court_pools:
+  indoor:
+    service_id: 7849893
+    court_ids: [100, 101]
+bookings:
+  - name: "roman_a"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: roman
+  - name: "roman_b"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: roman
+"""
+        write_multi(tmp_path, schedule)
+        with pytest.raises(ConfigError, match="duplicate"):
+            load_app_config(tmp_path)
+
+    def test_pool_legacy_overlap_same_profile_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        schedule = """\
+court_pools:
+  indoor:
+    service_id: 7849893
+    court_ids: [100, 101, 102]
+bookings:
+  - name: "pool_b"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: roman
+  - name: "legacy_b"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_id: 101
+    service_id: 7849893
+    profile: roman
+"""
+        write_multi(tmp_path, schedule)
+        with pytest.raises(ConfigError) as exc:
+            load_app_config(tmp_path)
+        msg = str(exc.value)
+        assert "duplicate" in msg
+        assert "101" in msg
+
+    def test_pool_legacy_overlap_different_profile_ok(
+        self, tmp_path: Path
+    ) -> None:
+        schedule = """\
+court_pools:
+  indoor:
+    service_id: 7849893
+    court_ids: [100, 101, 102]
+bookings:
+  - name: "pool_b"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_pool: indoor
+    profile: roman
+  - name: "legacy_b"
+    weekday: monday
+    slot_local_time: "20:00"
+    duration_minutes: 60
+    court_id: 101
+    service_id: 7849893
+    profile: askar
+"""
+        write_multi(tmp_path, schedule)
+        cfg = load_app_config(tmp_path)
+        assert len(cfg.bookings) == 2
