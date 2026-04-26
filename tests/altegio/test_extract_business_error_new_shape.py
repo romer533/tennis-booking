@@ -225,6 +225,121 @@ class TestUnknownLogging:
             for r in caplog.records
         )
 
+    def test_top_errors_unknown_text_logs_warn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Любой path возвращающий "unknown" должен log WARN с raw body для prod-debug."""
+        body = {"errors": {"code": 422, "message": "Some random thing happened"}}
+        resp = _resp(422, body)
+        caplog.set_level(logging.WARNING, logger="tennis_booking.altegio.client")
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "unknown"
+        assert any(
+            "altegio_unknown_error_body" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_meta_message_unknown_text_logs_warn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        body = {"meta": {"message": "bad input nonsense"}}
+        resp = _resp(400, body)
+        caplog.set_level(logging.WARNING, logger="tennis_booking.altegio.client")
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "unknown"
+        assert any(
+            "altegio_unknown_error_body" in r.getMessage()
+            for r in caplog.records
+        )
+
+
+# ---- N3: parser fall-through on incomplete legacy stub ---------------------
+
+
+class TestN3IncompleteLegacyFallthrough:
+    """Regression for incident 26.04 02:00 UTC.
+
+    Altegio параллельно отдавал в одном теле incomplete legacy stub
+    (`meta.errors=[{}]`) AND полный новый shape (`errors={"code":422,"message":...}`).
+    Старый парсер видел legacy stub, делал early return ("unknown") и НЕ читал
+    новый shape → engine fallback "lost" вместо grace.
+    """
+
+    def test_production_n2_incident_body(self) -> None:
+        """Реальное body N2 incident: incomplete legacy stub + новый shape."""
+        body = {
+            "meta": {"errors": [{}]},
+            "errors": {
+                "code": 422,
+                "message": "The service is not available at the selected time. Please choose a different time.",
+            },
+        }
+        resp = _resp(422, body)
+        code, message = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+        assert "service is not available" in message.lower()
+
+    def test_legacy_with_real_code_still_wins(self) -> None:
+        """Если legacy errors[0] имеет real code — preserve старое поведение."""
+        body = {
+            "meta": {"errors": [{"code": "real_code", "message": "from-legacy"}]},
+            "errors": {"code": 422, "message": "service is not available"},
+        }
+        resp = _resp(422, body)
+        code, message = _extract_business_error(resp, is_json=True)
+        assert code == "real_code"
+        assert message == "from-legacy"
+
+    def test_legacy_with_null_code_falls_through(self) -> None:
+        body = {
+            "meta": {"errors": [{"code": None, "message": "x"}]},
+            "errors": {
+                "code": 422,
+                "message": "service is not available again",
+            },
+        }
+        resp = _resp(422, body)
+        code, message = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+        assert "service is not available" in message.lower()
+
+    def test_legacy_with_empty_string_code_falls_through(self) -> None:
+        body = {
+            "meta": {"errors": [{"code": "", "message": "x"}]},
+            "errors": {
+                "code": 422,
+                "message": "service is not available again",
+            },
+        }
+        resp = _resp(422, body)
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+
+    def test_legacy_stub_only_no_new_shape_falls_to_unknown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Если incomplete legacy stub без alternative shape — fall to unknown + WARN."""
+        body = {"meta": {"errors": [{}]}}
+        resp = _resp(422, body)
+        caplog.set_level(logging.WARNING, logger="tennis_booking.altegio.client")
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "unknown"
+        assert any(
+            "altegio_unknown_error_body" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_legacy_stub_falls_through_to_meta_message(self) -> None:
+        body = {
+            "meta": {
+                "errors": [{}],
+                "message": "The service is not available right now",
+            }
+        }
+        resp = _resp(422, body)
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+
 
 # ---- N2 production regression: full HTTP roundtrip via respx --------------
 
