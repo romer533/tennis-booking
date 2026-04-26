@@ -1,13 +1,24 @@
 # Прогресс реализации
 
-> **Статус: MVP COMPLETE.** Весь код в `main`, готов к deploy. Полный план — [PLAN.md](PLAN.md). Deployment — [DEPLOYMENT.md](DEPLOYMENT.md).
+> **Статус: В PROD.** Сервис работает 24/7 на `194.195.241.83`. Полный план — [PLAN.md](PLAN.md). Deployment — [DEPLOYMENT.md](DEPLOYMENT.md).
 
-## Замержено в main
+## Production hardening (post-MVP)
+
+| PR | Что сделано |
+|----|-------------|
+| [#10–14](https://github.com/romer533/tennis-booking/pulls?q=is%3Apr+is%3Aclosed) | Court pools (fan-out по группе кортов), poll mode (мониторинг отмен за 3 дня), JSONL persistence (dedup против рестартов и manual bookings) |
+| [#15](https://github.com/romer533/tennis-booking/pull/15) | Incident 25.04: parser N2 shape `errors={code,message}` + grace polling (15-мин retry после T−0) |
+| [#16](https://github.com/romer533/tennis-booking/pull/16) | Cross-profile dedup fix: same slot OK для разных profiles (key включает profile_name) |
+| [#17](https://github.com/romer533/tennis-booking/pull/17) | min_lead_time guard: skip fire если slot < N часов (default 2) — free-cancel window |
+| [#18](https://github.com/romer533/tennis-booking/pull/18) | LEAD_DAYS 3 → 2: empirically confirmed Altegio horizon = today + 2 calendar days (через `search_dates` API) |
+| [#19](https://github.com/romer533/tennis-booking/pull/19) | **Incident 26.04**: parser fall-through на incomplete legacy stub `meta.errors=[{}]` + relax grace на ANY service_not_available (вместо ALL) |
+
+## Замержено в main (MVP)
 
 | Фаза | PR | Что сделано |
 |------|----|-------------|
 | Phase 1 | [#1](https://github.com/romer533/tennis-booking/pull/1) | Скелет: pyproject (hatchling), ruff/mypy strict, GitHub Actions CI (Python 3.11+3.12), пакеты `src/tennis_booking/{altegio,scheduler,engine,profiles,config,obs}`, smoke-тест |
-| Phase 3 — window | [#2](https://github.com/romer533/tennis-booking/pull/2) | `scheduler/window.py` — pure `next_open_window`. Правило T−3@07:00 Almaty. 110 тестов, 100% branch coverage |
+| Phase 3 — window | [#2](https://github.com/romer533/tennis-booking/pull/2) | `scheduler/window.py` — pure `next_open_window`. Правило T−2@07:00 Almaty (исправлено в PR #18). 110 тестов, 100% branch coverage |
 | Phase 5 — config | [#3](https://github.com/romer533/tennis-booking/pull/3) | pydantic v2 schema (frozen, strict, extra=forbid), YAML loader, cross-validation, PII masking. 163 теста, 97% branch coverage |
 | Phase 3 — Almaty rename | [#4](https://github.com/romer533/tennis-booking/pull/4) | `Atyrau → Almaty` rename, fix leap-year ожиданий под UTC+6 (Kazakhstan TZ unification 2024-03-01) |
 | Phase 3 — clock | [#5](https://github.com/romer533/tennis-booking/pull/5) | `scheduler/clock.py` — async SNTP drift check (raw UDP). 33 unit + 1 integration, 100% branch coverage |
@@ -16,16 +27,23 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 546 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 987 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
-## Готовность
+## Production status
 
-- ✅ Код полностью реализован (Phase 1–5, 7).
-- ✅ Тесты зелёные на CI (Python 3.11 + 3.12).
-- ✅ Deployment artifacts готовы (`__main__.py`, systemd, GitHub Actions).
-- ✅ Step-by-step deployment в [DEPLOYMENT.md](DEPLOYMENT.md).
-- ⏳ **Нужны действия от пользователя**: SSH ключи + GitHub Secrets + одноразовая настройка сервера (~30 мин).
-- ⏳ **NTP на сервере**: убедиться что drift < 50 мс (на dev-машине разработки был −2639 мс — `chronyc tracking` обязателен ДО старта).
+- ✅ Сервис работает на `194.195.241.83:13022` (Docker + systemd, auto-restart)
+- ✅ GitHub Actions CD: push в main → build → push в ghcr.io → ssh restart
+- ✅ NTP синхронизирован (`chronyc tracking` offset < 50 мс)
+- ✅ Текущее расписание: 59 bookings (3 профиля: roman/askar/alena, корты indoor + outdoor)
+- ✅ Persistence: `bookings.jsonl` для dedup (против рестартов и manual bookings)
+- ✅ Manual booking подтверждён: record_id 645327563 (26.04 23:00 outdoor)
+
+## Production incidents
+
+| Дата | Suspect | Root cause | Fix |
+|------|---------|------------|-----|
+| 25.04 02:00 UTC | All shots `unknown_code` → lost | Parser не знал shape `errors={"code":N,"message":"..."}` | PR #15 (parser N2 shape + grace polling) |
+| 26.04 02:00 UTC | Mix snv + unknown → lost (grace blocked) | (1) Parser early-return на incomplete legacy stub `meta.errors=[{}]`; (2) grace требовал ALL snv | PR #19 (parser fall-through + grace ANY snv) |
 
 ## Phase 0 — Altegio API research
 
