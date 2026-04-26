@@ -380,6 +380,7 @@ class BookingAttempt:
                 slot_taken_code: str | None = None
                 config_err_code: str | None = None
                 unknown_code: str | None = None
+                unknown_retry_idxs: list[int] = []
                 not_open_retry_idxs: list[int] = []
                 not_open_code_seen: str | None = None
                 transport_retry_idxs: list[int] = []
@@ -431,6 +432,7 @@ class BookingAttempt:
                             if not_open_code_seen is None:
                                 not_open_code_seen = exc.code
                         else:
+                            unknown_retry_idxs.append(idx)
                             if unknown_code is None:
                                 unknown_code = exc.code
                         continue
@@ -520,7 +522,12 @@ class BookingAttempt:
                         shots_fired=shots_fired,
                     )
 
-                if unknown_code is not None:
+                # Unknown_code fallback ONLY если в этом батче не было ни одного
+                # service_not_available. Mix snv + unknown (incident 26.04 02:00 UTC,
+                # parser fall-through fix) → silent reclassification: unknowns
+                # присоединяются к not_open retry/grace потоку. Иначе один
+                # incompletely-parsed shot блокирует grace для целой attempt.
+                if unknown_code is not None and not not_open_retry_idxs:
                     await self._cancel_all(pending)
                     self._log.info(
                         "result",
@@ -540,6 +547,12 @@ class BookingAttempt:
                         prearm_ok=prearm_ok,
                         shots_fired=shots_fired,
                     )
+
+                if unknown_retry_idxs and not_open_retry_idxs:
+                    # Reclassify: any unknown shot rides on the not_open retry/grace
+                    # path together with the snv shots from the same batch.
+                    not_open_retry_idxs.extend(unknown_retry_idxs)
+                    unknown_retry_idxs = []
 
                 # Not_open + transport retry. If not_open exhausted but transport is still
                 # live (global_deadline > not_open_deadline), drop not_open and keep

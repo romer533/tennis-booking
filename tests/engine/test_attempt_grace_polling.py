@@ -194,20 +194,26 @@ class TestG3GraceTimeout:
         assert len(client.search_timeslots_calls) >= 1
 
 
-# ---- G16: grace requires ALL service_not_available -------------------------
+# ---- G16: grace triggers on ANY service_not_available (was: requires ALL) --
+# Изменено в incident 26.04: parser fall-through + relaxed grace trigger.
+# Mix snv + unknown_code больше не блокирует grace — unknown reclassified
+# как часть not_open потока.
 
 
-class TestG16GraceRequiresAllSnv:
-    async def test_mixed_snv_and_unknown_no_grace(
+class TestG16GraceTriggersOnAnySnv:
+    async def test_mix_snv_and_unknown_triggers_grace(
         self,
         attempt_config: Callable[..., AttemptConfig],
         fake_client: Callable[..., FakeAltegioClient],
         make_clock: Callable[..., FakeClock],
         window_open: datetime,
     ) -> None:
-        """3 shots snv, 1 shot unknown_code → grace NOT triggered (current fallback lost)."""
+        """3 snv + 1 unknown → grace triggered (incident 26.04 N3 regression).
+
+        Раньше unknown_code блокировал grace fallback. Теперь — silent reclassify
+        unknown → not_open retry/grace путь.
+        """
         clock = make_clock()
-        # 3 snv + 1 unknown_code on first parallel batch.
         client = fake_client(
             [
                 _snv(),
@@ -216,19 +222,226 @@ class TestG16GraceRequiresAllSnv:
                 AltegioBusinessError(code="weird_code", message="x", http_status=422),
             ]
         )
+        # После исчерпания скрипта — sticky default snv (для retries в not_open loop).
+        client.set_default_side_effect(_snv())
+
+        async def bookable_then_flip() -> list[TimeSlot]:
+            client.set_default_side_effect(_booking(2001))
+            return [_bookable_slot()]
+
+        client.add_search(bookable_then_flip)
+
         cfg = attempt_config(
             court_ids=(STAFF_ID, STAFF_ID + 1, STAFF_ID + 2, STAFF_ID + 3),
             parallel_shots=4,
+            not_open_retry_ms=100,
+            not_open_deadline_s=1.0,
+            global_deadline_s=2.0,
             grace_polling=_grace_polling(period_s=120, interval_s=10),
         )
 
         attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
         result = await attempt.run(window_open)
 
-        # unknown code wins → engine returns lost (not grace).
+        assert result.status == "won"
+        assert result.booking is not None
+        assert result.booking.record_id == 2001
+        assert len(client.search_timeslots_calls) >= 1
+
+    async def test_one_snv_six_unknown_triggers_grace(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        """1 snv + 6 unknown → grace triggered (any single snv is enough)."""
+        clock = make_clock()
+        client = fake_client(
+            [
+                _snv(),
+                AltegioBusinessError(code="weird1", message="x", http_status=422),
+                AltegioBusinessError(code="weird2", message="x", http_status=422),
+                AltegioBusinessError(code="weird3", message="x", http_status=422),
+                AltegioBusinessError(code="weird4", message="x", http_status=422),
+                AltegioBusinessError(code="weird5", message="x", http_status=422),
+                AltegioBusinessError(code="weird6", message="x", http_status=422),
+            ]
+        )
+        client.set_default_side_effect(_snv())
+
+        async def bookable_then_flip() -> list[TimeSlot]:
+            client.set_default_side_effect(_booking(2002))
+            return [_bookable_slot()]
+
+        client.add_search(bookable_then_flip)
+
+        cfg = attempt_config(
+            court_ids=tuple(STAFF_ID + i for i in range(7)),
+            parallel_shots=7,
+            not_open_retry_ms=100,
+            not_open_deadline_s=1.0,
+            global_deadline_s=2.0,
+            grace_polling=_grace_polling(period_s=120, interval_s=10),
+        )
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "won"
+        assert result.booking is not None
+        assert result.booking.record_id == 2002
+
+    async def test_all_unknown_no_snv_falls_back_to_lost(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        """0 snv + 7 unknown → fallback "lost" (existing behavior preserved).
+
+        Без хотя бы одного snv нет основания думать, что слот ещё откроется.
+        """
+        clock = make_clock()
+        client = fake_client(
+            [
+                AltegioBusinessError(code="weird_code", message="x", http_status=422)
+                for _ in range(7)
+            ]
+        )
+        cfg = attempt_config(
+            court_ids=tuple(STAFF_ID + i for i in range(7)),
+            parallel_shots=7,
+            not_open_retry_ms=100,
+            not_open_deadline_s=1.0,
+            global_deadline_s=2.0,
+            grace_polling=_grace_polling(period_s=120, interval_s=10),
+        )
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
         assert result.status == "lost"
         assert result.business_code == "weird_code"
         assert len(client.search_timeslots_calls) == 0
+
+    async def test_slot_taken_overrides_mix_snv_unknown(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        """1 snv + 1 slot_taken + 5 unknown → status=lost, code=slot_taken (existing priority)."""
+        clock = make_clock()
+        # Inject one synthetic slot_taken via a fake code that is in SLOT_TAKEN_CODES.
+        # Currently SLOT_TAKEN_CODES is empty, so we can't realistically test
+        # a slot_taken priority short of monkeypatching. Use monkeypatch.
+        import tennis_booking.engine.attempt as attempt_mod
+
+        original = attempt_mod.SLOT_TAKEN_CODES
+        attempt_mod.SLOT_TAKEN_CODES = frozenset({"slot_taken"})  # type: ignore[misc]
+        try:
+            client = fake_client(
+                [
+                    _snv(),
+                    AltegioBusinessError(code="slot_taken", message="x", http_status=422),
+                    AltegioBusinessError(code="weird1", message="x", http_status=422),
+                    AltegioBusinessError(code="weird2", message="x", http_status=422),
+                    AltegioBusinessError(code="weird3", message="x", http_status=422),
+                    AltegioBusinessError(code="weird4", message="x", http_status=422),
+                    AltegioBusinessError(code="weird5", message="x", http_status=422),
+                ]
+            )
+            cfg = attempt_config(
+                court_ids=tuple(STAFF_ID + i for i in range(7)),
+                parallel_shots=7,
+                not_open_retry_ms=100,
+                not_open_deadline_s=1.0,
+                global_deadline_s=2.0,
+                grace_polling=_grace_polling(period_s=120, interval_s=10),
+            )
+
+            attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+            result = await attempt.run(window_open)
+
+            assert result.status == "lost"
+            assert result.business_code == "slot_taken"
+            assert len(client.search_timeslots_calls) == 0
+        finally:
+            attempt_mod.SLOT_TAKEN_CODES = original  # type: ignore[misc]
+
+    async def test_config_err_overrides_mix_snv_unknown(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        """1 snv + 1 unauthorized + 5 unknown → status=error, code=unauthorized (existing)."""
+        clock = make_clock()
+        client = fake_client(
+            [
+                _snv(),
+                AltegioBusinessError(code="unauthorized", message="x", http_status=401),
+                AltegioBusinessError(code="weird1", message="x", http_status=422),
+                AltegioBusinessError(code="weird2", message="x", http_status=422),
+                AltegioBusinessError(code="weird3", message="x", http_status=422),
+                AltegioBusinessError(code="weird4", message="x", http_status=422),
+                AltegioBusinessError(code="weird5", message="x", http_status=422),
+            ]
+        )
+        cfg = attempt_config(
+            court_ids=tuple(STAFF_ID + i for i in range(7)),
+            parallel_shots=7,
+            not_open_retry_ms=100,
+            not_open_deadline_s=1.0,
+            global_deadline_s=2.0,
+            grace_polling=_grace_polling(period_s=120, interval_s=10),
+        )
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "error"
+        assert result.business_code == "unauthorized"
+        assert len(client.search_timeslots_calls) == 0
+
+    async def test_mix_snv_unknown_grace_none_timeouts(
+        self,
+        attempt_config: Callable[..., AttemptConfig],
+        fake_client: Callable[..., FakeAltegioClient],
+        make_clock: Callable[..., FakeClock],
+        window_open: datetime,
+    ) -> None:
+        """Mix snv + unknown с grace_polling=None → старое поведение для snv:
+        not_open retries → timeout="not_open_deadline" (без grace)."""
+        clock = make_clock()
+        client = fake_client(
+            [
+                _snv(),
+                _snv(),
+                AltegioBusinessError(code="weird", message="x", http_status=422),
+                AltegioBusinessError(code="weird", message="x", http_status=422),
+            ]
+        )
+        client.set_default_side_effect(_snv())
+
+        cfg = attempt_config(
+            court_ids=(STAFF_ID, STAFF_ID + 1, STAFF_ID + 2, STAFF_ID + 3),
+            parallel_shots=4,
+            not_open_retry_ms=100,
+            not_open_deadline_s=1.0,
+            global_deadline_s=2.0,
+            grace_polling=None,
+        )
+
+        attempt = BookingAttempt(cfg, as_altegio_client(client), as_clock(clock))
+        result = await attempt.run(window_open)
+
+        assert result.status == "timeout"
+        assert result.business_code == "service_not_available"
 
 
 # ---- Additional grace state-machine tests ----------------------------------

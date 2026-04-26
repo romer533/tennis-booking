@@ -561,6 +561,12 @@ def _extract_business_error(response: httpx.Response, *, is_json: bool) -> tuple
       4. Else → ("unknown", raw truncated body), WARN-лог.
 
     Для shapes 2 и 3 code derived через text mapping (см. `_derive_code_from_text`).
+
+    Fall-through правило (incident 26.04 02:00 UTC): если `meta.errors[0]` —
+    dict без явного `code` (None / пусто), парсер НЕ возвращает "unknown",
+    а продолжает к остальным shapes. Иначе incomplete legacy stub с пустым
+    code блокирует чтение нового shape, и engine трактует это как
+    unknown_code → fallback "lost" вместо retry/grace.
     """
     if not is_json:
         raw = response.text or "<empty>"
@@ -585,23 +591,47 @@ def _extract_business_error(response: httpx.Response, *, is_json: bool) -> tuple
             if isinstance(errors, list) and errors:
                 first = errors[0]
                 if isinstance(first, dict):
-                    code = str(first.get("code") or "unknown")
-                    message = str(first.get("message") or "")
-                    return code, message
+                    raw_code = first.get("code")
+                    message_legacy = str(first.get("message") or "")
+                    # Только если ЕСТЬ настоящий code — return.
+                    # Иначе — fall through (Altegio может слать incomplete legacy stub
+                    # ВМЕСТЕ с полным новым shape в одном теле).
+                    if raw_code:
+                        return str(raw_code), message_legacy
 
         top_errors = body.get("errors")
         if isinstance(top_errors, dict):
             message_raw = top_errors.get("message")
             if isinstance(message_raw, str) and message_raw:
-                return _derive_code_from_text(message_raw), message_raw
+                derived = _derive_code_from_text(message_raw)
+                if derived == "unknown":
+                    raw = response.text or "<empty>"
+                    _logger.warning(
+                        "altegio_unknown_error_body shape=%r body=%r",
+                        "top_errors_dict",
+                        _truncate(raw),
+                    )
+                return derived, message_raw
 
         if isinstance(meta, dict):
             top_message = meta.get("message")
             if isinstance(top_message, str) and top_message:
-                return _derive_code_from_text(top_message), top_message
+                derived = _derive_code_from_text(top_message)
+                if derived == "unknown":
+                    raw = response.text or "<empty>"
+                    _logger.warning(
+                        "altegio_unknown_error_body shape=%r body=%r",
+                        "meta_message",
+                        _truncate(raw),
+                    )
+                return derived, top_message
 
     raw = response.text or "<empty>"
-    _logger.warning("altegio_unknown_error_body body=%r", _truncate(raw))
+    _logger.warning(
+        "altegio_unknown_error_body shape=%r body=%r",
+        "fallthrough_no_match",
+        _truncate(raw),
+    )
     return "unknown", _truncate(raw)
 
 
