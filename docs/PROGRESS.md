@@ -12,6 +12,7 @@
 | [#17](https://github.com/romer533/tennis-booking/pull/17) | min_lead_time guard: skip fire если slot < N часов (default 2) — free-cancel window |
 | [#18](https://github.com/romer533/tennis-booking/pull/18) | LEAD_DAYS 3 → 2: empirically confirmed Altegio horizon = today + 2 calendar days (через `search_dates` API) |
 | [#19](https://github.com/romer533/tennis-booking/pull/19) | **Incident 26.04**: parser fall-through на incomplete legacy stub `meta.errors=[{}]` + relax grace на ANY service_not_available (вместо ALL) |
+| [#20](https://github.com/romer533/tennis-booking/pull/20) | **Incident 27.04**: parser text mapping — добавлен `"no staff members available for booking"` → `service_not_available`. Altegio начал слать новый текст ошибки, который попадал в `unknown` → fallback `lost`. Одна строка в `_TEXT_CODE_MAPPING` + 5 regression тестов |
 
 ## Замержено в main (MVP)
 
@@ -27,7 +28,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 987 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 992 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
@@ -37,6 +38,7 @@
 - ✅ Текущее расписание: 59 bookings (3 профиля: roman/askar/alena, корты indoor + outdoor)
 - ✅ Persistence: `bookings.jsonl` для dedup (против рестартов и manual bookings)
 - ✅ Manual booking подтверждён: record_id 645327563 (26.04 23:00 outdoor)
+- ✅ **Первая автоматическая бронь (27.04 02:00 UTC):** record_id 645621093 (roman, ср 29.04 07:00 indoor). 1 win из 11 attempts — остальные lost из-за N4 incident (см. ниже).
 
 ## Production incidents
 
@@ -44,6 +46,7 @@
 |------|---------|------------|-----|
 | 25.04 02:00 UTC | All shots `unknown_code` → lost | Parser не знал shape `errors={"code":N,"message":"..."}` | PR #15 (parser N2 shape + grace polling) |
 | 26.04 02:00 UTC | Mix snv + unknown → lost (grace blocked) | (1) Parser early-return на incomplete legacy stub `meta.errors=[{}]`; (2) grace требовал ALL snv | PR #19 (parser fall-through + grace ANY snv) |
+| 27.04 02:00 UTC | 10/11 attempts lost code=`unknown` | Altegio начал слать новый текст `"Currently, there are no staff members available for booking"` — `_derive_code_from_text` его не маппил | PR #20 (одна строка в `_TEXT_CODE_MAPPING`). Lesson: всегда смотреть raw body перед изобретением сложных fix'ов — чуть не ушёл в N3 v2 retry-релакс. |
 
 ## Phase 0 — Altegio API research
 
