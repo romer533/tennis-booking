@@ -534,6 +534,10 @@ class AltegioClient:
 
 _TEXT_CODE_MAPPING: tuple[tuple[str, str], ...] = (
     ("service is not available", "service_not_available"),
+    # incident 27.04 02:00 UTC: Altegio начал слать новый текст для того же
+    # кейса (slot ещё не открыт). Маппится в тот же business code,
+    # т.к. семантика идентична — engine ретраит его как not_open.
+    ("no staff members available for booking", "service_not_available"),
     ("unauthorized", "unauthorized"),
 )
 

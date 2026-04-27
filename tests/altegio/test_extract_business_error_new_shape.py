@@ -193,6 +193,81 @@ class TestTextMappingCaseInsensitive:
         assert code == "unauthorized"
 
 
+class TestNoStaffMembersTextMapping:
+    """Regression for production incident 27.04 02:00 UTC.
+
+    Altegio начал слать новый текст ошибки для того же кейса (slot ещё не открыт).
+    Семантика идентична `"service is not available at the selected time"` —
+    маппится в тот же business code `service_not_available`, чтобы engine
+    ретраил его как not_open (а не fallback "lost").
+    """
+
+    def test_no_staff_members_message_maps_to_snv(self) -> None:
+        """Точная фраза из production incident 27.04."""
+        body = {
+            "errors": {
+                "code": 422,
+                "message": "Currently, there are no staff members available for booking",
+            },
+            "meta": {
+                "message": "Currently, there are no staff members available for booking"
+            },
+        }
+        resp = _resp(422, body)
+        code, message = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+        assert "no staff members available for booking" in message.lower()
+
+    def test_no_staff_members_case_variations(self) -> None:
+        variants = (
+            "CURRENTLY, THERE ARE NO STAFF MEMBERS AVAILABLE FOR BOOKING",
+            "currently, there are no staff members available for booking",
+            "Currently, There Are No Staff Members Available For Booking",
+            "no staff members available for booking",
+            "NO STAFF MEMBERS AVAILABLE FOR BOOKING",
+        )
+        for msg in variants:
+            body = {"errors": {"code": 422, "message": msg}}
+            resp = _resp(422, body)
+            code, _ = _extract_business_error(resp, is_json=True)
+            assert code == "service_not_available", f"failed for variant: {msg!r}"
+
+    def test_no_staff_members_in_top_errors_dict_shape(self) -> None:
+        """Top errors dict shape (production incident shape)."""
+        body = {
+            "errors": {
+                "code": 422,
+                "message": "Currently, there are no staff members available for booking",
+            }
+        }
+        resp = _resp(422, body)
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+
+    def test_no_staff_members_in_meta_message_shape(self) -> None:
+        """meta.message-only shape."""
+        body = {
+            "meta": {
+                "message": "Currently, there are no staff members available for booking"
+            }
+        }
+        resp = _resp(422, body)
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+
+    def test_existing_service_not_available_still_works(self) -> None:
+        """Регрессия: добавление новой фразы не должно ломать старую."""
+        body = {
+            "errors": {
+                "code": 422,
+                "message": "The service is not available at the selected time. Please choose a different time.",
+            }
+        }
+        resp = _resp(422, body)
+        code, _ = _extract_business_error(resp, is_json=True)
+        assert code == "service_not_available"
+
+
 class TestUnknownLogging:
     def test_unknown_logs_warn(self, caplog: pytest.LogCaptureFixture) -> None:
         body = {"unrecognized": "shape"}
