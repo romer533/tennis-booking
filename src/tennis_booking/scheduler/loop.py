@@ -54,10 +54,11 @@ DEFAULT_MIN_LEAD_TIME_HOURS = 0.0
 # not a normal "we just missed today's window" situation.
 LOOKAHEAD_WEEKS = 4
 # Post-window poll keeps hunting for cancellations released by other users
-# after the natural window phase has resolved with a loss. 60s tick mirrors
-# the default pre-window poll interval; cheap (one search_timeslots POST per
-# minute) and well within Altegio's rate tolerance for our expected fleet.
-DEFAULT_POST_WINDOW_POLL_INTERVAL_S = 60
+# after the natural window phase has resolved with a loss. 120s tick keeps
+# Altegio load conservative (one search_timeslots POST per 2 minutes) — this
+# default was raised from 60s after PR #21's Cloudflare 403 incident, where
+# any extra request volume was suspected. 30s is the floor for sanity.
+DEFAULT_POST_WINDOW_POLL_INTERVAL_S = 120
 
 _DAILY_INTERVAL_S = 24 * 60 * 60
 
@@ -203,14 +204,15 @@ class SchedulerLoop:
         store: BookingStore | None = None,
         min_lead_time_hours: float = DEFAULT_MIN_LEAD_TIME_HOURS,
         post_window_poll_interval_s: int = DEFAULT_POST_WINDOW_POLL_INTERVAL_S,
+        post_window_poll_enabled: bool = True,
     ) -> None:
         if min_lead_time_hours < 0.0 or min_lead_time_hours > 168.0:
             raise ValueError(
                 f"min_lead_time_hours must be in [0.0, 168.0], got {min_lead_time_hours}"
             )
-        if post_window_poll_interval_s < 10:
+        if post_window_poll_interval_s < 30:
             raise ValueError(
-                f"post_window_poll_interval_s must be >= 10, got {post_window_poll_interval_s}"
+                f"post_window_poll_interval_s must be >= 30, got {post_window_poll_interval_s}"
             )
         self._config = config
         self._client = altegio_client
@@ -222,6 +224,7 @@ class SchedulerLoop:
         self._store = store
         self._min_lead_time_hours = min_lead_time_hours
         self._post_window_poll_interval_s = post_window_poll_interval_s
+        self._post_window_poll_enabled = post_window_poll_enabled
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
@@ -272,6 +275,10 @@ class SchedulerLoop:
 
     async def run(self) -> None:
         self._log.info("loop_starting", ntp_required=self._ntp_required)
+        if not self._post_window_poll_enabled:
+            # Logged once at startup (not on each booking). Operator wants to
+            # immediately see in journalctl that the kill switch is in effect.
+            self._log.info("post_window_poll_disabled")
 
         await self._startup_ntp_check()
 
@@ -429,6 +436,8 @@ class SchedulerLoop:
         regular recompute path skips it (window_open < now) and walks one week
         further; this method catches it.
         """
+        if not self._post_window_poll_enabled:
+            return
         candidate_slot = self._next_slot_occurrence(
             now_utc, booking.weekday, booking.slot_local_time
         )
@@ -811,6 +820,8 @@ class SchedulerLoop:
         Skipped when (slot - now) <= effective_min_lead — there is no useful
         polling window left and the fire-time guard would refuse any fire anyway.
         """
+        if not self._post_window_poll_enabled:
+            return
         booking = scheduled.booking
         effective_min_lead = (
             booking.min_lead_time_hours

@@ -150,6 +150,30 @@ def test_ntp_required_env_truthy_default() -> None:
     assert cli._parse_ntp_required("maybe") is True
 
 
+def test_post_window_poll_env_default_true() -> None:
+    """No env → enabled=True (default-on; kill switch is opt-out)."""
+    assert cli._parse_post_window_poll_enabled(None) is True
+
+
+def test_post_window_poll_env_explicit_false() -> None:
+    assert cli._parse_post_window_poll_enabled("0") is False
+    assert cli._parse_post_window_poll_enabled("false") is False
+    assert cli._parse_post_window_poll_enabled(" FALSE ") is False
+    assert cli._parse_post_window_poll_enabled("no") is False
+    assert cli._parse_post_window_poll_enabled("off") is False
+    assert cli._parse_post_window_poll_enabled("") is False
+
+
+def test_post_window_poll_env_explicit_true() -> None:
+    """Anything not in the explicit falsy set stays True — typos must not
+    silently disable the feature."""
+    assert cli._parse_post_window_poll_enabled("1") is True
+    assert cli._parse_post_window_poll_enabled("true") is True
+    assert cli._parse_post_window_poll_enabled("yes") is True
+    # Unrecognised value → True (fail-safe).
+    assert cli._parse_post_window_poll_enabled("maybe") is True
+
+
 def test_install_signal_handlers_on_windows_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

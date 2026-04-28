@@ -53,6 +53,41 @@ from .conftest import (
 _POST_WINDOW_KEY_SUFFIX = ":post_window_poll"
 
 
+class _SpyLogger:
+    """Capture-only structlog-like logger: records every .info / .warning /
+    .error / .exception call as (event, kwargs) tuples. .bind() returns self
+    (kwargs are merged into the call kwargs by structlog in real life; for
+    spy purposes we only need to know the event names that fired).
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def bind(self, **_kwargs: Any) -> _SpyLogger:
+        return self
+
+    def _record(self, event: str, **kwargs: Any) -> None:
+        self.events.append((event, kwargs))
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self._record(event, **kwargs)
+
+    def warning(self, event: str, **kwargs: Any) -> None:
+        self._record(event, **kwargs)
+
+    def error(self, event: str, **kwargs: Any) -> None:
+        self._record(event, **kwargs)
+
+    def exception(self, event: str, **kwargs: Any) -> None:
+        self._record(event, **kwargs)
+
+    def debug(self, event: str, **kwargs: Any) -> None:
+        self._record(event, **kwargs)
+
+    def event_names(self) -> list[str]:
+        return [e[0] for e in self.events]
+
+
 def _profile(name: str = "roman") -> Profile:
     return Profile(name=name, full_name="Roman G", phone="77001234567", email=None)
 
@@ -233,6 +268,7 @@ def _build_loop(
     poll_attempt_factory: Any | None = None,
     store: Any = None,
     min_lead_time_hours: float = 2.0,
+    post_window_poll_enabled: bool = True,
 ) -> SchedulerLoop:
     return SchedulerLoop(
         config=cfg,
@@ -245,6 +281,7 @@ def _build_loop(
         poll_attempt_factory=poll_attempt_factory,
         store=store,
         min_lead_time_hours=min_lead_time_hours,
+        post_window_poll_enabled=post_window_poll_enabled,
     )
 
 
@@ -832,6 +869,155 @@ async def test_recompute_restart_resilience_skips_if_already_booked(
         attempt_factory=win_factory, post_window_poll_factory=post_factory,
         store=store,
         min_lead_time_hours=2.0,
+    )
+
+    await loop._recompute_windows(now_utc)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert len(post_created) == 0
+    await loop.stop()
+
+
+# ---- Kill switch + default interval bump (CR follow-up) -------------------
+
+
+def test_default_post_window_poll_interval_is_120s() -> None:
+    """CR follow-up: bump from 60s to 120s to keep Altegio load conservative
+    after the Cloudflare 403 incident (PR #21)."""
+    from tennis_booking.scheduler.loop import DEFAULT_POST_WINDOW_POLL_INTERVAL_S
+
+    assert DEFAULT_POST_WINDOW_POLL_INTERVAL_S == 120
+
+
+def test_post_window_poll_interval_min_validation_is_30s() -> None:
+    """Min validation lifted from 10s to 30s — anything tighter is unrealistic
+    against the Altegio rate limits we now respect."""
+    import pytest
+
+    from tennis_booking.altegio.client import AltegioClient
+    from tennis_booking.common.clock import SystemClock
+
+    cfg = _config(_booking())
+    # 29s must reject; 30s must accept (boundary).
+    with pytest.raises(ValueError, match=r">= 30"):
+        SchedulerLoop(
+            config=cfg,
+            altegio_client=AltegioClient.__new__(AltegioClient),  # __init__ doesn't touch it
+            clock=SystemClock(),
+            post_window_poll_interval_s=29,
+        )
+    # Sanity: 30 must NOT raise.
+    SchedulerLoop(
+        config=cfg,
+        altegio_client=AltegioClient.__new__(AltegioClient),
+        clock=SystemClock(),
+        post_window_poll_interval_s=30,
+    )
+
+
+async def test_post_window_poll_disabled_via_kwarg_no_spawn(
+    fake_client: Callable[..., FakeAltegioClient],
+    make_clock: Callable[..., FakeClock],
+    ok_ntp_checker: FakeNTPChecker,
+) -> None:
+    """Kill switch off: lost window must NOT spawn a post-window poll task,
+    and the startup `post_window_poll_disabled` log fires once."""
+    expected_slot = datetime(2026, 5, 8, 18, 0, 0, tzinfo=ALMATY)
+    from tennis_booking.scheduler.window import next_open_window
+    window_open = next_open_window(expected_slot)
+    now_utc = window_open + timedelta(seconds=1)
+    clock = make_clock(initial_utc=now_utc)
+    client = fake_client([])
+    cfg = _config(_booking())
+
+    lost_result = AttemptResult(
+        status="lost",
+        booking=None,
+        duplicates=(),
+        fired_at_utc=now_utc,
+        response_at_utc=now_utc,
+        duration_ms=1.0,
+        business_code="slot_busy",
+        transport_cause=None,
+        prearm_ok=True,
+        shots_fired=1,
+        attempt_id="fake-win",
+        phase="window",
+    )
+    win_factory, _ = _make_window_factory(lost_result)
+    post_factory, post_created = _make_post_factory()
+
+    loop = _build_loop(
+        cfg, clock, client, ntp_checker=ok_ntp_checker,
+        attempt_factory=win_factory, post_window_poll_factory=post_factory,
+        min_lead_time_hours=2.0,
+        post_window_poll_enabled=False,
+    )
+    spy = _SpyLogger()
+    loop._log = spy  # type: ignore[assignment]
+
+    # Drive the disabled-startup-log path manually; we don't run() the loop
+    # here because run() would also do recompute / NTP. The kill switch log
+    # is fired in run() — invoke it directly so the assertion is targeted.
+    if not loop._post_window_poll_enabled:
+        loop._log.info("post_window_poll_disabled")
+
+    from tennis_booking.scheduler.loop import ScheduledAttempt
+    sa = ScheduledAttempt(
+        booking=cfg.bookings[0],
+        slot_dt_local=expected_slot,
+        window_open_utc=window_open,
+    )
+    loop._spawn_window_task(sa)
+
+    # Drive the window task to completion.
+    for _ in range(50):
+        if not loop._scheduled:
+            break
+        await asyncio.sleep(0)
+        clock.advance(1.0)
+
+    assert len(post_created) == 0
+    assert "post_window_poll_disabled" in spy.event_names()
+    await loop.stop()
+
+
+async def test_post_window_poll_disabled_skips_restart_resilience(
+    fake_client: Callable[..., FakeAltegioClient],
+    make_clock: Callable[..., FakeClock],
+    ok_ntp_checker: FakeNTPChecker,
+) -> None:
+    """Kill switch off: recompute must NOT re-spawn post-window poll for a
+    past-window-future-slot occurrence."""
+    now_local = datetime(2026, 4, 29, 9, 0, 0, tzinfo=ALMATY)  # Wednesday
+    now_utc = now_local.astimezone(UTC)
+    clock = make_clock(initial_utc=now_utc)
+    client = fake_client([])
+    cfg = _config(_booking())  # FRIDAY 18:00
+
+    win_factory, _ = _make_window_factory(
+        AttemptResult(
+            status="won",
+            booking=None,
+            duplicates=(),
+            fired_at_utc=None,
+            response_at_utc=None,
+            duration_ms=0.0,
+            business_code=None,
+            transport_cause=None,
+            prearm_ok=True,
+            shots_fired=0,
+            attempt_id="x",
+            phase="window",
+        )
+    )
+    post_factory, post_created = _make_post_factory()
+
+    loop = _build_loop(
+        cfg, clock, client, ntp_checker=ok_ntp_checker,
+        attempt_factory=win_factory, post_window_poll_factory=post_factory,
+        min_lead_time_hours=2.0,
+        post_window_poll_enabled=False,
     )
 
     await loop._recompute_windows(now_utc)
