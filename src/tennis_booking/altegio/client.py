@@ -308,6 +308,10 @@ class AltegioClient:
         content_type = response.headers.get("content-type", "")
         is_json = "application/json" in content_type.lower()
 
+        if _is_cloudflare_challenge(response, status=status, content_type=content_type):
+            _log_cloudflare_challenge(response, content_type=content_type)
+            raise AltegioTransportError("cloudflare_challenge")
+
         if 400 <= status < 500:
             code, message = _extract_business_error(response, is_json=is_json)
             if status == 401 and code == "unknown":
@@ -523,6 +527,9 @@ class AltegioClient:
 
         # 4xx path
         if 400 <= status < 500:
+            if _is_cloudflare_challenge(response, status=status, content_type=content_type):
+                _log_cloudflare_challenge(response, content_type=content_type)
+                raise AltegioTransportError("cloudflare_challenge")
             code, message = _extract_business_error(response, is_json=is_json)
             if status == 401 and code == "unknown":
                 code = "unauthorized"
@@ -530,6 +537,46 @@ class AltegioClient:
 
         # 1xx / 3xx — unexpected, treat as transport.
         raise AltegioTransportError(f"unexpected status {status}")
+
+
+_CLOUDFLARE_BODY_MARKERS: tuple[str, ...] = (
+    "just a moment...",
+    "challenges.cloudflare.com",
+)
+
+
+def _is_cloudflare_challenge(
+    response: httpx.Response, *, status: int, content_type: str
+) -> bool:
+    """Detect Cloudflare interstitial challenge.
+
+    Production observation 28.04 02:00 UTC: ~6% of book_record responses came
+    back as 403 + text/html with the standard "Just a moment..." page. The
+    request never reached Altegio backend — semantically a transport-layer
+    failure (engine should retry within the global deadline), not a business
+    error.
+
+    Match requires: 403 status, text/html content-type, AND at least one
+    Cloudflare marker in the body.
+    """
+    if status != 403:
+        return False
+    if not content_type.lower().startswith("text/html"):
+        return False
+    body = (response.text or "").lower()
+    return any(marker in body for marker in _CLOUDFLARE_BODY_MARKERS)
+
+
+def _log_cloudflare_challenge(
+    response: httpx.Response, *, content_type: str
+) -> None:
+    body_len = len(response.text or "")
+    _logger.info(
+        "altegio_cloudflare_challenge_detected http_status=%d content_type=%r body_len=%d",
+        response.status_code,
+        content_type,
+        body_len,
+    )
 
 
 _TEXT_CODE_MAPPING: tuple[tuple[str, str], ...] = (
