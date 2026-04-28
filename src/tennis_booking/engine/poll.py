@@ -56,9 +56,23 @@ class PollConfigData:
 class PollAttempt:
     """Monitor mode: polls search/timeslots, fires create_booking on is_bookable.
 
-    State machine:
-      1. sleep until effective_start = max(now, slot_dt_local_utc - start_offset_days)
-      2. while now_utc < slot_dt_local_utc:
+    Two modes (selected via `post_window_mode`):
+
+    Pre-window mode (default, post_window_mode=False):
+      Effective start = max(now, slot_dt_local_utc - start_offset_days);
+      stop_at = slot_dt_local_utc. Used to catch slots opening early before
+      the natural T-2d 07:00 window — runs alongside a window task.
+
+    Post-window mode (post_window_mode=True):
+      Effective start = now (immediate); stop_at = slot_dt_local_utc - min_lead.
+      Used after a window task has resolved with status=lost/timeout to keep
+      hunting for cancellations released by other users (typical 24-48h
+      before the slot). Stops min_lead_time_hours before the slot itself,
+      so the existing fire-time guard never has to refuse a fire.
+
+    State machine (both modes):
+      1. sleep until effective_start (no-op in post_window_mode)
+      2. while now_utc < stop_at_utc:
          a. if won_event.is_set() → early return (cancelled)
          b. POST /booking/search/timeslots/ (date=slot_local_date, staff_ids=court_ids)
          c. find matching slot (dt == slot_dt_local AND is_bookable=True)
@@ -69,7 +83,7 @@ class PollAttempt:
             - on lost/transport: clear won_event, continue polling
             - on config_err (unauthorized): return error immediately
          e. sleep interval_s (respect cancellation)
-      3. now_utc >= slot_dt_local_utc → timeout("slot_passed")
+      3. now_utc >= stop_at_utc → timeout (reason depends on mode).
     """
 
     def __init__(
@@ -80,6 +94,8 @@ class PollAttempt:
         clock: Clock,
         won_event: asyncio.Event | None = None,
         store: BookingStore | None = None,
+        *,
+        post_window_mode: bool = False,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
@@ -87,13 +103,14 @@ class PollAttempt:
         self._clock = clock
         self._store = store
         self._won_event = won_event if won_event is not None else asyncio.Event()
+        self._post_window_mode = post_window_mode
         self._used = False
         self._attempt_id = uuid.uuid4().hex
         log_bindings: dict[str, object] = {
             "attempt_id": self._attempt_id,
             "slot_dt_local": attempt_config.slot_dt_local.isoformat(),
             "dry_run": client.config.dry_run,
-            "phase": "poll",
+            "phase": "post_window_poll" if post_window_mode else "poll",
             "poll_interval_s": poll.interval_s,
             "poll_start_offset_days": poll.start_offset_days,
         }
@@ -113,21 +130,33 @@ class PollAttempt:
         start_mono = self._clock.monotonic()
 
         slot_utc = self._config.slot_dt_local.astimezone(start_utc.tzinfo)
-        effective_start_utc = slot_utc - timedelta(days=self._poll.start_offset_days)
-        if effective_start_utc < start_utc:
+
+        if self._post_window_mode:
+            # Post-window: start polling immediately; stop min_lead_time_hours
+            # before the slot so the existing fire-time guard inside _fire_shots
+            # never has to refuse a fire (it would be wasted work).
             effective_start_utc = start_utc
+            min_lead_s = self._config.min_lead_time_hours * 3600.0
+            stop_at_utc = slot_utc - timedelta(seconds=min_lead_s)
+            stopped_reason = "post_window_window_closed"
+        else:
+            effective_start_utc = slot_utc - timedelta(days=self._poll.start_offset_days)
+            if effective_start_utc < start_utc:
+                effective_start_utc = start_utc
+            stop_at_utc = slot_utc
+            stopped_reason = "slot_passed"
 
         self._log.info(
             "poll_scheduled",
             effective_start_utc=effective_start_utc.isoformat(),
-            stop_at_utc=slot_utc.isoformat(),
+            stop_at_utc=stop_at_utc.isoformat(),
         )
 
-        if slot_utc <= start_utc:
+        if stop_at_utc <= start_utc:
             self._log.warning(
                 "slot_passed_before_start",
                 now_utc=start_utc.isoformat(),
-                slot_utc=slot_utc.isoformat(),
+                stop_at_utc=stop_at_utc.isoformat(),
             )
             return self._make_result(
                 status="timeout",
@@ -137,7 +166,7 @@ class PollAttempt:
                 response_at_utc=None,
                 start_mono=start_mono,
                 business_code=None,
-                transport_cause="slot_passed",
+                transport_cause=stopped_reason,
                 shots_fired=0,
             )
 
@@ -159,8 +188,8 @@ class PollAttempt:
                 )
 
             now_utc = self._clock.now_utc()
-            if now_utc >= slot_utc:
-                self._log.info("poll_stopped", reason="slot_passed")
+            if now_utc >= stop_at_utc:
+                self._log.info("poll_stopped", reason=stopped_reason)
                 return self._make_result(
                     status="timeout",
                     booking=None,
@@ -169,7 +198,7 @@ class PollAttempt:
                     response_at_utc=None,
                     start_mono=start_mono,
                     business_code=None,
-                    transport_cause="slot_passed",
+                    transport_cause=stopped_reason,
                     shots_fired=0,
                 )
 
@@ -567,6 +596,11 @@ class PollAttempt:
         duration_ms = (self._clock.monotonic() - start_mono) * 1000.0
         # `prearm_ok=False` — poll mode does not use prearm (slot state is
         # probed cheaply via search_timeslots, no TLS pre-warm needed).
+        # Phase remains "poll" even for post_window_mode — AttemptPhase is a
+        # narrow Literal["window", "poll"] union and persistence (BookedSlot)
+        # already only knows about these two engine paths. The post-window
+        # nuance is preserved in structlog bindings ("phase": "post_window_poll")
+        # for telemetry without expanding the public type surface.
         return AttemptResult(
             status=status,
             booking=booking,

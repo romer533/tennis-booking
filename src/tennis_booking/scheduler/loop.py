@@ -30,12 +30,14 @@ from tennis_booking.scheduler.window import next_open_window
 __all__ = [
     "DEFAULT_MIN_LEAD_TIME_HOURS",
     "DEFAULT_NTP_THRESHOLD_MS",
+    "DEFAULT_POST_WINDOW_POLL_INTERVAL_S",
     "LOOKAHEAD_WEEKS",
     "RECOMPUTE_LOCAL_TIME",
     "SHUTDOWN_TIMEOUT_S",
     "AttemptFactory",
     "NTPChecker",
     "PollAttemptFactory",
+    "PostWindowPollFactory",
     "ScheduledAttempt",
     "SchedulerLoop",
 ]
@@ -51,6 +53,11 @@ DEFAULT_MIN_LEAD_TIME_HOURS = 0.0
 # still open in the future. Anything beyond ~4 weeks indicates broken config,
 # not a normal "we just missed today's window" situation.
 LOOKAHEAD_WEEKS = 4
+# Post-window poll keeps hunting for cancellations released by other users
+# after the natural window phase has resolved with a loss. 60s tick mirrors
+# the default pre-window poll interval; cheap (one search_timeslots POST per
+# minute) and well within Altegio's rate tolerance for our expected fleet.
+DEFAULT_POST_WINDOW_POLL_INTERVAL_S = 60
 
 _DAILY_INTERVAL_S = 24 * 60 * 60
 
@@ -86,6 +93,17 @@ PollAttemptFactory = Callable[
     ],
     PollAttempt,
 ]
+PostWindowPollFactory = Callable[
+    [
+        AttemptConfig,
+        PollConfigData,
+        AltegioClient,
+        Clock,
+        asyncio.Event,
+        BookingStore | None,
+    ],
+    PollAttempt,
+]
 NTPChecker = Callable[[], Awaitable[CheckResult]]
 
 
@@ -109,6 +127,25 @@ def _default_poll_attempt_factory(
     return PollAttempt(config, poll, client, clock, won_event=won_event, store=store)
 
 
+def _default_post_window_poll_factory(
+    config: AttemptConfig,
+    poll: PollConfigData,
+    client: AltegioClient,
+    clock: Clock,
+    won_event: asyncio.Event,
+    store: BookingStore | None,
+) -> PollAttempt:
+    return PollAttempt(
+        config,
+        poll,
+        client,
+        clock,
+        won_event=won_event,
+        store=store,
+        post_window_mode=True,
+    )
+
+
 def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
     async def _check() -> CheckResult:
         return await check_ntp_drift(threshold_ms=threshold_ms)
@@ -117,8 +154,11 @@ def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
 
 
 # Suffix appended to the base scheduled key for poll-mode tasks. Window task
-# uses the bare key (backward compat with existing dedup logic).
+# uses the bare key (backward compat with existing dedup logic). The post-window
+# poll runs after the window task has resolved (lost / timeout) and uses its
+# own suffix so a re-recompute does not duplicate it onto the still-live key.
 _POLL_KEY_SUFFIX = ":poll"
+_POST_WINDOW_POLL_KEY_SUFFIX = ":post_window_poll"
 
 
 def _scheduled_key(
@@ -157,14 +197,20 @@ class SchedulerLoop:
         ntp_threshold_ms: int = DEFAULT_NTP_THRESHOLD_MS,
         attempt_factory: AttemptFactory | None = None,
         poll_attempt_factory: PollAttemptFactory | None = None,
+        post_window_poll_factory: PostWindowPollFactory | None = None,
         ntp_checker: NTPChecker | None = None,
         shutdown_timeout_s: float = SHUTDOWN_TIMEOUT_S,
         store: BookingStore | None = None,
         min_lead_time_hours: float = DEFAULT_MIN_LEAD_TIME_HOURS,
+        post_window_poll_interval_s: int = DEFAULT_POST_WINDOW_POLL_INTERVAL_S,
     ) -> None:
         if min_lead_time_hours < 0.0 or min_lead_time_hours > 168.0:
             raise ValueError(
                 f"min_lead_time_hours must be in [0.0, 168.0], got {min_lead_time_hours}"
+            )
+        if post_window_poll_interval_s < 10:
+            raise ValueError(
+                f"post_window_poll_interval_s must be >= 10, got {post_window_poll_interval_s}"
             )
         self._config = config
         self._client = altegio_client
@@ -175,6 +221,7 @@ class SchedulerLoop:
         self._shutdown_timeout_s = shutdown_timeout_s
         self._store = store
         self._min_lead_time_hours = min_lead_time_hours
+        self._post_window_poll_interval_s = post_window_poll_interval_s
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
@@ -182,6 +229,11 @@ class SchedulerLoop:
             poll_attempt_factory
             if poll_attempt_factory is not None
             else _default_poll_attempt_factory
+        )
+        self._post_window_poll_factory: PostWindowPollFactory = (
+            post_window_poll_factory
+            if post_window_poll_factory is not None
+            else _default_post_window_poll_factory
         )
         self._ntp_checker: NTPChecker = (
             ntp_checker if ntp_checker is not None else _default_ntp_checker(ntp_threshold_ms)
@@ -299,6 +351,13 @@ class SchedulerLoop:
         for booking in self._config.bookings:
             if not booking.enabled:
                 continue
+            # Restart resilience: an occurrence whose window has passed but slot
+            # is still in the future means we have nothing actively scheduled
+            # for it (window task already exited at startup or before restart).
+            # Spawn a post-window poll directly so a service restart between
+            # T-2d 07:00 and T does not silently drop cancellation hunting.
+            await self._maybe_restart_post_window_poll(booking, now_utc)
+
             nearest = self._next_slot_occurrence(
                 now_utc, booking.weekday, booking.slot_local_time
             )
@@ -351,6 +410,87 @@ class SchedulerLoop:
             )
         self._log.info("recompute_done", scheduled=len(result))
         return result
+
+    async def _maybe_restart_post_window_poll(
+        self, booking: ResolvedBooking, now_utc: datetime
+    ) -> None:
+        """Recompute-time restart resilience for post-window poll.
+
+        For the nearest-future weekly occurrence of this booking: if its window
+        has already opened (i.e. the window task either finished before restart
+        or was never registered) and the slot is still > min_lead_time_hours
+        away, no persistence record exists, and we don't already have a
+        post-window task running for this slot — spawn one.
+
+        Why "nearest-future" not "previous": `_next_slot_occurrence` returns
+        the nearest *strictly future* slot. When that occurrence's window has
+        already passed, this is exactly the slot for which post-window polling
+        can still pay off (catch a cancellation between now and slot_dt). The
+        regular recompute path skips it (window_open < now) and walks one week
+        further; this method catches it.
+        """
+        candidate_slot = self._next_slot_occurrence(
+            now_utc, booking.weekday, booking.slot_local_time
+        )
+        slot_utc = candidate_slot.astimezone(now_utc.tzinfo)
+
+        window_open_utc = next_open_window(candidate_slot)
+        if window_open_utc >= now_utc:
+            # Window hasn't opened yet — handled by the regular path.
+            return
+
+        effective_min_lead = (
+            booking.min_lead_time_hours
+            if booking.min_lead_time_hours is not None
+            else self._min_lead_time_hours
+        )
+        min_lead_s = effective_min_lead * 3600.0
+        time_to_slot_s = (slot_utc - now_utc).total_seconds()
+        if time_to_slot_s <= min_lead_s:
+            return
+
+        if self._store is not None:
+            existing = await self._store.find(
+                slot_dt_local=candidate_slot,
+                court_ids=list(booking.court_ids),
+                service_id=booking.service_id,
+                profile_name=booking.profile.name,
+            )
+            if existing is not None:
+                return
+
+        post_window_key = _scheduled_key(
+            booking.name,
+            candidate_slot,
+            booking.court_ids,
+            booking.service_id,
+            suffix=_POST_WINDOW_POLL_KEY_SUFFIX,
+        )
+        existing_task = self._scheduled.get(post_window_key)
+        if existing_task is not None and not existing_task.done():
+            return
+
+        # If the window task is somehow still scheduled (e.g. recompute fired
+        # before _wait_and_attempt completed), let the natural lost-window path
+        # spawn the post-window poll instead — avoids racing two spawns.
+        win_key = _scheduled_key(
+            booking.name, candidate_slot, booking.court_ids, booking.service_id
+        )
+        if win_key in self._scheduled:
+            return
+
+        sa = ScheduledAttempt(
+            booking=booking,
+            slot_dt_local=candidate_slot,
+            window_open_utc=window_open_utc,
+        )
+        self._log.info(
+            "post_window_poll_restart_resilience",
+            booking_name=booking.name,
+            slot_dt_local=candidate_slot.isoformat(),
+            time_to_slot_s=time_to_slot_s,
+        )
+        self._spawn_post_window_poll_task(sa)
 
     @staticmethod
     def _next_slot_occurrence(
@@ -536,6 +676,13 @@ class SchedulerLoop:
                 attempt_id=result.attempt_id,
                 phase=result.phase,
             )
+
+            # Window phase ended without a win → keep hunting for cancellations
+            # released by other users between now and slot_dt_local. Status=error
+            # is intentionally excluded — that signals a config / auth failure
+            # which post-window polling cannot recover from.
+            if result.status in ("lost", "timeout"):
+                self._maybe_spawn_post_window_poll(scheduled, log)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — never let one task kill the loop
@@ -656,6 +803,171 @@ class SchedulerLoop:
                 booking.service_id,
             )
 
+    def _maybe_spawn_post_window_poll(
+        self, scheduled: ScheduledAttempt, log: Any
+    ) -> None:
+        """Schedule a post-window poll task if the slot is still far enough away.
+
+        Skipped when (slot - now) <= effective_min_lead — there is no useful
+        polling window left and the fire-time guard would refuse any fire anyway.
+        """
+        booking = scheduled.booking
+        effective_min_lead = (
+            booking.min_lead_time_hours
+            if booking.min_lead_time_hours is not None
+            else self._min_lead_time_hours
+        )
+        slot_utc = scheduled.slot_dt_local.astimezone(self._clock.now_utc().tzinfo)
+        time_to_slot_s = (slot_utc - self._clock.now_utc()).total_seconds()
+        min_lead_s = effective_min_lead * 3600.0
+        if time_to_slot_s <= min_lead_s:
+            log.info(
+                "post_window_poll_skipped",
+                reason="too_close_to_slot",
+                time_to_slot_s=time_to_slot_s,
+                min_lead_s=min_lead_s,
+            )
+            return
+        self._spawn_post_window_poll_task(scheduled)
+
+    def _spawn_post_window_poll_task(self, sa: ScheduledAttempt) -> None:
+        key = _scheduled_key(
+            sa.booking.name,
+            sa.slot_dt_local,
+            sa.booking.court_ids,
+            sa.booking.service_id,
+            suffix=_POST_WINDOW_POLL_KEY_SUFFIX,
+        )
+        existing = self._scheduled.get(key)
+        if existing is not None and not existing.done():
+            self._log.info(
+                "attempt_skipped_duplicate",
+                booking_name=sa.booking.name,
+                slot_dt_local=sa.slot_dt_local.isoformat(),
+                phase="post_window_poll",
+            )
+            return
+        task = asyncio.create_task(
+            self._wait_and_post_window_poll(sa),
+            name=f"post-window-poll:{sa.booking.name}:{sa.slot_dt_local.isoformat()}",
+        )
+        self._scheduled[key] = task
+        self._log.info(
+            "attempt_scheduled",
+            booking_name=sa.booking.name,
+            court_ids=sa.booking.court_ids,
+            pool_name=sa.booking.pool_name,
+            slot_dt_local=sa.slot_dt_local.isoformat(),
+            phase="post_window_poll",
+            interval_s=self._post_window_poll_interval_s,
+        )
+
+    async def _wait_and_post_window_poll(self, scheduled: ScheduledAttempt) -> None:
+        booking = scheduled.booking
+        key = _scheduled_key(
+            booking.name,
+            scheduled.slot_dt_local,
+            booking.court_ids,
+            booking.service_id,
+            suffix=_POST_WINDOW_POLL_KEY_SUFFIX,
+        )
+        won_event = self._won_event_for(
+            booking.name,
+            scheduled.slot_dt_local,
+            booking.court_ids,
+            booking.service_id,
+        )
+        log = self._log.bind(
+            booking_name=booking.name,
+            court_ids=booking.court_ids,
+            pool_name=booking.pool_name,
+            slot_dt_local=scheduled.slot_dt_local.isoformat(),
+            phase="post_window_poll",
+        )
+
+        try:
+            attempt_cfg = self._build_attempt_config(scheduled)
+            # PollConfigData.start_offset_days is required (>= 1) but is unused
+            # in post_window_mode (effective_start = now). Pin to 1 — keeps the
+            # validator happy without leaking mode-dependent semantics into the
+            # config dataclass.
+            poll_data = PollConfigData(
+                interval_s=self._post_window_poll_interval_s,
+                start_offset_days=1,
+            )
+
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._running.add(current_task)
+
+            if won_event.is_set():
+                log.info("post_window_poll_skipped_sibling_won")
+                return
+
+            if self._store is not None:
+                existing = await self._store.find(
+                    slot_dt_local=scheduled.slot_dt_local,
+                    court_ids=list(booking.court_ids),
+                    service_id=booking.service_id,
+                    profile_name=booking.profile.name,
+                )
+                if existing is not None:
+                    log.info(
+                        "post_window_poll_skipped_already_booked",
+                        record_id=existing.record_id,
+                        existing_phase=existing.phase,
+                    )
+                    return
+
+            log.info("post_window_poll_starting")
+            attempt = self._post_window_poll_factory(
+                attempt_cfg, poll_data, self._client, self._clock, won_event, self._store
+            )
+            try:
+                result: AttemptResult = await attempt.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "attempt_crashed",
+                    error=str(e),
+                    exc_type=type(e).__name__,
+                )
+                return
+
+            if result.status == "won":
+                won_event.set()
+
+            log.info(
+                "attempt_finished",
+                status=result.status,
+                business_code=result.business_code,
+                transport_cause=result.transport_cause,
+                duration_ms=result.duration_ms,
+                shots_fired=result.shots_fired,
+                attempt_id=result.attempt_id,
+                phase=result.phase,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "attempt_crashed",
+                error=str(e),
+                exc_type=type(e).__name__,
+            )
+        finally:
+            self._scheduled.pop(key, None)
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._running.discard(current_task)
+            self._cleanup_won_event_if_done(
+                booking.name,
+                scheduled.slot_dt_local,
+                booking.court_ids,
+                booking.service_id,
+            )
+
     def _cleanup_won_event_if_done(
         self,
         booking_name: str,
@@ -663,14 +975,26 @@ class SchedulerLoop:
         court_ids: tuple[int, ...],
         service_id: int,
     ) -> None:
-        """Remove the shared won_event once both window and poll tasks for this
-        (booking, slot) have exited. Prevents indefinite growth across recomputes.
+        """Remove the shared won_event once all task variants (window, poll,
+        post-window poll) for this (booking, slot) have exited. Prevents
+        indefinite growth across recomputes.
         """
         win_key = _scheduled_key(booking_name, slot_dt_local, court_ids, service_id)
         poll_key = _scheduled_key(
             booking_name, slot_dt_local, court_ids, service_id, suffix=_POLL_KEY_SUFFIX
         )
-        if win_key in self._scheduled or poll_key in self._scheduled:
+        post_window_key = _scheduled_key(
+            booking_name,
+            slot_dt_local,
+            court_ids,
+            service_id,
+            suffix=_POST_WINDOW_POLL_KEY_SUFFIX,
+        )
+        if (
+            win_key in self._scheduled
+            or poll_key in self._scheduled
+            or post_window_key in self._scheduled
+        ):
             return
         evt_key = (booking_name, slot_dt_local.isoformat(), hash(court_ids), service_id)
         self._won_events.pop(evt_key, None)
