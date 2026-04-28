@@ -102,6 +102,7 @@ ALTEGIO_BEARER_TOKEN=
 # ALTEGIO_DRY_RUN=0
 # TENNIS_LOG_DIR=/app/logs        # default; overrides only for unusual setups
 # TENNIS_NTP_REQUIRED=1            # set 0 only in dev with no NTP
+# TENNIS_POST_WINDOW_POLL_ENABLED=1     # set 0 to disable post-window cancellation polling
 EOF
     chown "root:$SERVICE_GROUP" "$CONFIG_DIR/env"
     chmod 0640 "$CONFIG_DIR/env"

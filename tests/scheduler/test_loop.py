@@ -1667,8 +1667,11 @@ class TestWindowPassedSkipsToNextWeek:
         ok_ntp_checker: FakeNTPChecker,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Force the first two candidate windows past, the third in the future.
-        # Expected: two window_passed warns, then a successful schedule.
+        # Force the first three patched-window calls past, the fourth in the future.
+        # The first call comes from the post-window restart-resilience pre-check
+        # (added in `feat/post-window-poll`); the next two are inner-loop iterations
+        # that produce the `window_passed` warns; the fourth resolves to a future
+        # window. Expected: two `window_passed` warns, then a successful schedule.
         now_utc = datetime(2026, 4, 24, 19, 17, 0, tzinfo=UTC)
         clock = make_clock(initial_utc=now_utc)
         client = fake_client([])
@@ -1691,7 +1694,7 @@ class TestWindowPassedSkipsToNextWeek:
 
         def fake_window(_slot: datetime) -> datetime:
             call_count["n"] += 1
-            return past_utc if call_count["n"] <= 2 else future_utc
+            return past_utc if call_count["n"] <= 3 else future_utc
 
         monkeypatch.setattr(loop_module, "next_open_window", fake_window)
 

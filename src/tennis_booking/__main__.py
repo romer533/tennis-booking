@@ -137,6 +137,18 @@ def _parse_ntp_required(env_value: str | None) -> bool:
     return normalized not in ("0", "false", "no", "off", "")
 
 
+def _parse_post_window_poll_enabled(env_value: str | None) -> bool:
+    """TENNIS_POST_WINDOW_POLL_ENABLED kill switch for the post-window
+    cancellation-hunting poll. Default True; only explicit falsy strings
+    disable it. Same parse rules as TENNIS_NTP_REQUIRED — an unrecognised
+    value (typo) stays True so the feature is not silently dropped.
+    """
+    if env_value is None:
+        return True
+    normalized = env_value.strip().lower()
+    return normalized not in ("0", "false", "no", "off", "")
+
+
 def _install_signal_handlers(
     event_loop: asyncio.AbstractEventLoop,
     scheduler_loop: SchedulerLoop,
@@ -200,6 +212,15 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "— will not fail-fast on NTP errors"
         )
 
+    post_window_poll_enabled = _parse_post_window_poll_enabled(
+        os.environ.get("TENNIS_POST_WINDOW_POLL_ENABLED")
+    )
+    if not post_window_poll_enabled:
+        logger.warning(
+            "post_window_poll_enabled=False (TENNIS_POST_WINDOW_POLL_ENABLED env override) "
+            "— post-window cancellation polling is disabled"
+        )
+
     try:
         min_lead_time_hours = _parse_min_lead_time_hours(
             os.environ.get("TENNIS_MIN_LEAD_TIME_HOURS")
@@ -235,6 +256,7 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             ntp_required=ntp_required,
             store=store,
             min_lead_time_hours=min_lead_time_hours,
+            post_window_poll_enabled=post_window_poll_enabled,
         )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)

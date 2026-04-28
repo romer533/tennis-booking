@@ -84,6 +84,7 @@ def _build_loop(
     ntp_checker: FakeNTPChecker,
     attempt_factory: Any = None,
     poll_attempt_factory: Any = None,
+    post_window_poll_factory: Any = None,
 ) -> SchedulerLoop:
     return SchedulerLoop(
         config=config,
@@ -94,6 +95,7 @@ def _build_loop(
         ntp_checker=ntp_checker,  # type: ignore[arg-type]
         attempt_factory=attempt_factory,
         poll_attempt_factory=poll_attempt_factory,
+        post_window_poll_factory=post_window_poll_factory,
     )
 
 
@@ -333,7 +335,9 @@ async def test_won_event_cleanup_after_both_tasks_done(
     ok_ntp_checker: FakeNTPChecker,
     fake_attempt_factory: Callable[..., Any],
 ) -> None:
-    """After both window and poll tasks finish, the shared won_event must be evicted."""
+    """After all task variants (window, poll, post-window poll) finish, the shared
+    won_event must be evicted.
+    """
     now_utc = datetime(2026, 4, 21, 1, 55, 0, tzinfo=UTC)
     clock = make_clock(initial_utc=now_utc)
     client = fake_client([])
@@ -355,17 +359,20 @@ async def test_won_event_cleanup_after_both_tasks_done(
         )
     )
     poll_factory, _poll_created = _make_poll_factory()
+    post_factory, _post_created = _make_poll_factory()
 
     loop = _build_loop(
         cfg, clock, client, ntp_checker=ok_ntp_checker,
         attempt_factory=factory, poll_attempt_factory=poll_factory,
+        post_window_poll_factory=post_factory,
     )
 
     sched = await loop._recompute_windows(now_utc)
     loop._spawn_attempts(sched)
 
-    # Advance past prearm + window
-    for _ in range(50):
+    # Advance past prearm + window; post-window poll spawned on lost-window also
+    # needs to finish (FakePollAttempt returns lost("slot_passed") immediately).
+    for _ in range(80):
         if not loop._scheduled:
             break
         await asyncio.sleep(0)
