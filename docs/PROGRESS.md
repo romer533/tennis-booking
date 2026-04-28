@@ -15,6 +15,7 @@
 | [#20](https://github.com/romer533/tennis-booking/pull/20) | **Incident 27.04**: parser text mapping — добавлен `"no staff members available for booking"` → `service_not_available`. Altegio начал слать новый текст ошибки, который попадал в `unknown` → fallback `lost`. Одна строка в `_TEXT_CODE_MAPPING` + 5 regression тестов |
 | [#21](https://github.com/romer533/tennis-booking/pull/21) | **Cloudflare detector**: 6% запросов 28.04 fire получали `403 + text/html + Just a moment...` (Altegio за Cloudflare). Раньше → `unknown` → fallback `lost`. Теперь → `AltegioTransportError(cause="cloudflare_challenge")` → engine retry до global_deadline. 13 тестов |
 | [#22](https://github.com/romer533/tennis-booking/pull/22) | **Post-window poll**: после проигранного window phase scheduler сразу планировал следующую неделю, забывая текущий слот. Теперь — продолжает поллить `search_timeslots` каждые 120s до `slot - min_lead_time_hours`, ловя отмены. `PollAttempt` параметризован `post_window_mode`. Restart resilience через `_maybe_restart_post_window_poll`. Kill switch `TENNIS_POST_WINDOW_POLL_ENABLED` (default true). 24 теста |
+| [#23](https://github.com/romer533/tennis-booking/pull/23) | **Shared poll cache + jitter**: 21 polls делали `search_timeslots` одновременно каждые 120s — Cloudflare overload risk. `PollResultCache` с key `(date, pool)` дедуплицирует concurrent fetches через per-key `asyncio.Lock`. Initial jitter `U(0, interval/2)` + per-tick ±10% распределяет burst. Verified в проде: **10x reduction** (3 HTTP fetches per cycle вместо 21), **91.4% hit ratio**. 27 тестов |
 
 ## Замержено в main (MVP)
 
@@ -30,7 +31,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 1029 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1056 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
