@@ -76,6 +76,11 @@ class AttemptConfig:
     # the guard (default for tests / legacy code paths). Production sets via
     # TENNIS_MIN_LEAD_TIME_HOURS env var → SchedulerLoop → AttemptConfig.
     min_lead_time_hours: float = 0.0
+    # Optional opaque pool key for the shared poll-result cache. Plumbed from
+    # ResolvedBooking.pool_name when the booking targets a court_pool. Used
+    # purely for cache key construction + log readability — when None,
+    # PollAttempt synthesises a fallback key from court_ids.
+    pool_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.slot_dt_local.tzinfo is None:
