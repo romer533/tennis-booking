@@ -19,6 +19,7 @@ from tennis_booking.engine.attempt import (
     BookingAttempt,
 )
 from tennis_booking.engine.poll import PollAttempt, PollConfigData
+from tennis_booking.engine.poll_cache import PollResultCache
 from tennis_booking.persistence import BookingStore
 from tennis_booking.scheduler.clock import CheckResult, check_ntp_drift
 from tennis_booking.scheduler.clock_errors import (
@@ -117,34 +118,60 @@ def _default_attempt_factory(
     return BookingAttempt(config, client, clock, store=store)
 
 
-def _default_poll_attempt_factory(
-    config: AttemptConfig,
-    poll: PollConfigData,
-    client: AltegioClient,
-    clock: Clock,
-    won_event: asyncio.Event,
-    store: BookingStore | None,
-) -> PollAttempt:
-    return PollAttempt(config, poll, client, clock, won_event=won_event, store=store)
+def _make_default_poll_attempt_factory(
+    cache: PollResultCache | None,
+) -> PollAttemptFactory:
+    """Build the production PollAttempt factory. Closes over the loop's shared
+    `PollResultCache` so every spawned PollAttempt consults the same cache —
+    that is what collapses N polls per cycle to 1 fetch per (date, pool).
+    """
+
+    def _factory(
+        config: AttemptConfig,
+        poll: PollConfigData,
+        client: AltegioClient,
+        clock: Clock,
+        won_event: asyncio.Event,
+        store: BookingStore | None,
+    ) -> PollAttempt:
+        return PollAttempt(
+            config,
+            poll,
+            client,
+            clock,
+            won_event=won_event,
+            store=store,
+            cache=cache,
+            pool_key=config.pool_key,
+        )
+
+    return _factory
 
 
-def _default_post_window_poll_factory(
-    config: AttemptConfig,
-    poll: PollConfigData,
-    client: AltegioClient,
-    clock: Clock,
-    won_event: asyncio.Event,
-    store: BookingStore | None,
-) -> PollAttempt:
-    return PollAttempt(
-        config,
-        poll,
-        client,
-        clock,
-        won_event=won_event,
-        store=store,
-        post_window_mode=True,
-    )
+def _make_default_post_window_poll_factory(
+    cache: PollResultCache | None,
+) -> PostWindowPollFactory:
+    def _factory(
+        config: AttemptConfig,
+        poll: PollConfigData,
+        client: AltegioClient,
+        clock: Clock,
+        won_event: asyncio.Event,
+        store: BookingStore | None,
+    ) -> PollAttempt:
+        return PollAttempt(
+            config,
+            poll,
+            client,
+            clock,
+            won_event=won_event,
+            store=store,
+            post_window_mode=True,
+            cache=cache,
+            pool_key=config.pool_key,
+        )
+
+    return _factory
 
 
 def _default_ntp_checker(threshold_ms: int) -> NTPChecker:
@@ -228,15 +255,24 @@ class SchedulerLoop:
         self._attempt_factory: AttemptFactory = (
             attempt_factory if attempt_factory is not None else _default_attempt_factory
         )
+        # Shared poll-result cache for the lifetime of this SchedulerLoop.
+        # TTL == post_window_poll_interval_s (the default poll cadence). Both
+        # the in-window poll and the post-window poll share the same cache;
+        # this is intentional — they hit the SAME endpoint with the SAME
+        # (date, pool) on overlapping schedules, and are exactly the
+        # requests we need to coalesce.
+        self._poll_cache: PollResultCache = PollResultCache(
+            self._clock, ttl_s=float(post_window_poll_interval_s)
+        )
         self._poll_attempt_factory: PollAttemptFactory = (
             poll_attempt_factory
             if poll_attempt_factory is not None
-            else _default_poll_attempt_factory
+            else _make_default_poll_attempt_factory(self._poll_cache)
         )
         self._post_window_poll_factory: PostWindowPollFactory = (
             post_window_poll_factory
             if post_window_poll_factory is not None
-            else _default_post_window_poll_factory
+            else _make_default_post_window_poll_factory(self._poll_cache)
         )
         self._ntp_checker: NTPChecker = (
             ntp_checker if ntp_checker is not None else _default_ntp_checker(ntp_threshold_ms)
@@ -1057,6 +1093,7 @@ class SchedulerLoop:
             profile_name=booking.profile.name,
             email=booking.profile.email,
             min_lead_time_hours=effective_min_lead,
+            pool_key=booking.pool_name,
         )
 
     # --- timing helpers -------------------------------------------------

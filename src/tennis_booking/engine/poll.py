@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,7 @@ from tennis_booking.persistence.models import SCHEMA_VERSION
 
 from .attempt import AttemptConfig, AttemptResult, AttemptStatus
 from .codes import CONFIG_ERROR_CODES, SLOT_TAKEN_CODES
+from .poll_cache import PollResultCache
 
 __all__ = ["PollAttempt", "PollConfigData"]
 
@@ -28,6 +30,27 @@ _logger = structlog.get_logger(__name__)
 
 _PER_SHOT_TIMEOUT_S = 5.0
 _SEARCH_TIMEOUT_S = 5.0
+
+# Jitter envelope around interval_s to break synchronised polling waves.
+# Initial jitter: U(0, _INITIAL_JITTER_FRAC * interval_s) one-shot before the
+# first tick. Per-tick jitter: ±_TICK_JITTER_FRAC * interval_s on every sleep.
+_INITIAL_JITTER_FRAC = 0.5
+_TICK_JITTER_FRAC = 0.1
+# SystemRandom is process-instance random — much higher quality than the
+# default Mersenne twister for spreading concurrent polls. Cost is negligible
+# compared to the network round-trip we are spreading.
+_jitter_rng = random.SystemRandom()
+
+
+def _synthesize_pool_key(court_ids: tuple[int, ...]) -> str:
+    """Deterministic fallback pool key when caller doesn't provide one.
+
+    Sorted to canonicalise (cf. tuple identity vs set equality). Two polls
+    with the same staff_ids set must collide; two with different sets must
+    not. Format chosen to be obviously synthetic in logs ("courts:5,6,7" vs
+    a real pool name).
+    """
+    return "courts:" + ",".join(str(c) for c in sorted(court_ids))
 
 
 @dataclass(frozen=True)
@@ -96,6 +119,8 @@ class PollAttempt:
         store: BookingStore | None = None,
         *,
         post_window_mode: bool = False,
+        cache: PollResultCache | None = None,
+        pool_key: str | None = None,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
@@ -104,6 +129,15 @@ class PollAttempt:
         self._store = store
         self._won_event = won_event if won_event is not None else asyncio.Event()
         self._post_window_mode = post_window_mode
+        self._cache = cache
+        # When pool_key is not provided, fall back to a deterministic synthetic
+        # key derived from the full court_ids tuple. This guarantees that polls
+        # which differ ONLY by profile (same date, same staff_ids) coalesce,
+        # while polls with different court sets stay separated (correctness:
+        # different court sets fetch different Altegio responses).
+        self._pool_key = pool_key if pool_key is not None else _synthesize_pool_key(
+            attempt_config.court_ids
+        )
         self._used = False
         self._attempt_id = uuid.uuid4().hex
         log_bindings: dict[str, object] = {
@@ -113,6 +147,7 @@ class PollAttempt:
             "phase": "post_window_poll" if post_window_mode else "poll",
             "poll_interval_s": poll.interval_s,
             "poll_start_offset_days": poll.start_offset_days,
+            "pool_key": self._pool_key,
         }
         if len(attempt_config.court_ids) <= 7:
             log_bindings["court_ids"] = tuple(attempt_config.court_ids)
@@ -172,6 +207,14 @@ class PollAttempt:
 
         await self._sleep_until_utc(effective_start_utc)
 
+        # Initial jitter: spread the first tick across [0, interval/2). Without
+        # it, when SchedulerLoop spawns N polls in a tight `_spawn_attempts`
+        # loop, all of them call `search_timeslots` within ms of each other
+        # every interval_s — the synchronised pattern Cloudflare flags as a bot.
+        # Cache absorbs this for same-(date,pool) polls; jitter handles
+        # different (date,pool) polls.
+        await self._initial_jitter_sleep()
+
         while True:
             if self._won_event.is_set():
                 self._log.info("poll_cancelled_by_sibling")
@@ -203,11 +246,7 @@ class PollAttempt:
                 )
 
             try:
-                slots = await self._client.search_timeslots(
-                    date_local=self._config.slot_dt_local.date(),
-                    staff_ids=list(self._config.court_ids),
-                    timeout_s=_SEARCH_TIMEOUT_S,
-                )
+                slots = await self._search_timeslots()
             except AltegioBusinessError as e:
                 if e.code in CONFIG_ERROR_CODES:
                     self._log.error(
@@ -294,7 +333,47 @@ class PollAttempt:
             await self._sleep_interval()
 
     async def _sleep_interval(self) -> None:
-        await self._clock.sleep(self._poll.interval_s)
+        # Per-tick jitter ±10% — even after the cache collapses N→1, the polls
+        # for *different* (date, pool) combinations still happen on identical
+        # tick boundaries if not jittered. This shaves the remaining sync.
+        base = float(self._poll.interval_s)
+        jitter = _jitter_rng.uniform(-base * _TICK_JITTER_FRAC, base * _TICK_JITTER_FRAC)
+        delay = base + jitter
+        if delay <= 0:
+            # Defensive: should be impossible with _TICK_JITTER_FRAC < 1.0,
+            # but if someone bumps the constant, never go negative.
+            delay = base
+        await self._clock.sleep(delay)
+
+    async def _initial_jitter_sleep(self) -> None:
+        # One-shot smear before the first tick so that N polls spawned in the
+        # same SchedulerLoop pass don't fire their first search_timeslots in
+        # a 30 ms cluster. Range [0, interval/2) is wide enough to break any
+        # observable pattern while still letting the first poll fetch quickly
+        # in the worst case (no fresh cache entry).
+        delay = _jitter_rng.uniform(0.0, self._poll.interval_s * _INITIAL_JITTER_FRAC)
+        if delay <= 0:
+            return
+        await self._clock.sleep(delay)
+
+    async def _search_timeslots(self) -> list[TimeSlot]:
+        # Compute date IN ALMATY: slot_dt_local is already Almaty-tz-aware,
+        # but using `.date()` directly is brittle if the tzinfo is something
+        # else (defensive — AttemptConfig validates ALMATY, but we call
+        # .astimezone explicitly to make the timezone semantics visible at
+        # the cache boundary).
+        date_local = self._config.slot_dt_local.astimezone(ALMATY).date()
+
+        async def _fetch() -> list[TimeSlot]:
+            return await self._client.search_timeslots(
+                date_local=date_local,
+                staff_ids=list(self._config.court_ids),
+                timeout_s=_SEARCH_TIMEOUT_S,
+            )
+
+        if self._cache is None:
+            return await _fetch()
+        return await self._cache.get_or_fetch(date_local, self._pool_key, _fetch)
 
     async def _sleep_until_utc(self, target_utc: datetime) -> None:
         now_utc = self._clock.now_utc()
