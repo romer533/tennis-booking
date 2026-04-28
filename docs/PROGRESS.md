@@ -13,6 +13,7 @@
 | [#18](https://github.com/romer533/tennis-booking/pull/18) | LEAD_DAYS 3 → 2: empirically confirmed Altegio horizon = today + 2 calendar days (через `search_dates` API) |
 | [#19](https://github.com/romer533/tennis-booking/pull/19) | **Incident 26.04**: parser fall-through на incomplete legacy stub `meta.errors=[{}]` + relax grace на ANY service_not_available (вместо ALL) |
 | [#20](https://github.com/romer533/tennis-booking/pull/20) | **Incident 27.04**: parser text mapping — добавлен `"no staff members available for booking"` → `service_not_available`. Altegio начал слать новый текст ошибки, который попадал в `unknown` → fallback `lost`. Одна строка в `_TEXT_CODE_MAPPING` + 5 regression тестов |
+| [#21](https://github.com/romer533/tennis-booking/pull/21) | **Cloudflare detector**: 6% запросов 28.04 fire получали `403 + text/html + Just a moment...` (Altegio за Cloudflare). Раньше → `unknown` → fallback `lost`. Теперь → `AltegioTransportError(cause="cloudflare_challenge")` → engine retry до global_deadline. 13 тестов |
 
 ## Замержено в main (MVP)
 
@@ -28,7 +29,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 992 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1005 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
@@ -39,6 +40,7 @@
 - ✅ Persistence: `bookings.jsonl` для dedup (против рестартов и manual bookings)
 - ✅ Manual booking подтверждён: record_id 645327563 (26.04 23:00 outdoor)
 - ✅ **Первая автоматическая бронь (27.04 02:00 UTC):** record_id 645621093 (roman, ср 29.04 07:00 indoor). 1 win из 11 attempts — остальные lost из-за N4 incident (см. ниже).
+- ✅ **Победа poll mode (28.04 01:59:55 UTC):** record_id 645847642 (roman, чт 30.04 07:00 indoor) — за 5 секунд до открытия окна. Бонус-дубль 645847641 на другом корте → отменён вручную (user предпочитает manual cancel вместо auto-cancel). 0/10 wins в window mode из-за Cloudflare 403 (см. PR #21).
 
 ## Production incidents
 
@@ -47,6 +49,7 @@
 | 25.04 02:00 UTC | All shots `unknown_code` → lost | Parser не знал shape `errors={"code":N,"message":"..."}` | PR #15 (parser N2 shape + grace polling) |
 | 26.04 02:00 UTC | Mix snv + unknown → lost (grace blocked) | (1) Parser early-return на incomplete legacy stub `meta.errors=[{}]`; (2) grace требовал ALL snv | PR #19 (parser fall-through + grace ANY snv) |
 | 27.04 02:00 UTC | 10/11 attempts lost code=`unknown` | Altegio начал слать новый текст `"Currently, there are no staff members available for booking"` — `_derive_code_from_text` его не маппил | PR #20 (одна строка в `_TEXT_CODE_MAPPING`). Lesson: всегда смотреть raw body перед изобретением сложных fix'ов — чуть не ушёл в N3 v2 retry-релакс. |
+| 28.04 02:00 UTC | 0/10 window wins, 1 poll win + dup | (1) Altegio за Cloudflare antibot — 6% запросов получали 403+html challenge → engine fallback `lost code=unknown`. (2) Engine не отменяет дубликаты при multi-success fan-out (user предпочёл manual cancel). | PR #21 (Cloudflare detector → transport retry). Cancel-fix отложен. |
 
 ## Phase 0 — Altegio API research
 
