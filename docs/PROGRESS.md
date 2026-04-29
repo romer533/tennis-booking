@@ -17,6 +17,7 @@
 | [#22](https://github.com/romer533/tennis-booking/pull/22) | **Post-window poll**: после проигранного window phase scheduler сразу планировал следующую неделю, забывая текущий слот. Теперь — продолжает поллить `search_timeslots` каждые 120s до `slot - min_lead_time_hours`, ловя отмены. `PollAttempt` параметризован `post_window_mode`. Restart resilience через `_maybe_restart_post_window_poll`. Kill switch `TENNIS_POST_WINDOW_POLL_ENABLED` (default true). 24 теста |
 | [#23](https://github.com/romer533/tennis-booking/pull/23) | **Shared poll cache + jitter**: 21 polls делали `search_timeslots` одновременно каждые 120s — Cloudflare overload risk. `PollResultCache` с key `(date, pool)` дедуплицирует concurrent fetches через per-key `asyncio.Lock`. Initial jitter `U(0, interval/2)` + per-tick ±10% распределяет burst. Verified в проде: **10x reduction** (3 HTTP fetches per cycle вместо 21), **91.4% hit ratio**. 27 тестов |
 | [#24](https://github.com/romer533/tennis-booking/pull/24) | **cf-ray logging**: `_log_cloudflare_challenge` теперь пишет `cf_ray`, `cf_mitigated`, `cf_cache_status` headers. Подготовка к whitelist request админу Daulet — нужны конкретные cf-ray IDs для CF support trace. 4 теста |
+| [#25](https://github.com/romer533/tennis-booking/pull/25) | **Defensive Cloudflare mitigation**: Daulet отказал в whitelist → переключаемся на снижение burst rate. (1) `BookingRule.max_parallel_shots: int\|None` — cap fan-out до random subset (config: 3). Initial burst 77 → 33 POSTs. (2) Exponential backoff на transport retry: CF cause 100/200/400/800/1600/2000ms cap 2000, other transport 50/100/200/400/500ms cap 500. Per-shot tasks — backoff не блокирует sibling. Skip retry если deadline-now < delay+0.1s. 25 тестов. Schedule.yaml на сервере обновлён `max_parallel_shots: 3` для всех 59 bookings. |
 
 ## Замержено в main (MVP)
 
@@ -32,7 +33,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 1060 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1085 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
