@@ -1094,6 +1094,7 @@ class SchedulerLoop:
             email=booking.profile.email,
             min_lead_time_hours=effective_min_lead,
             pool_key=booking.pool_name,
+            max_parallel_shots=booking.max_parallel_shots,
         )
 
     # --- timing helpers -------------------------------------------------

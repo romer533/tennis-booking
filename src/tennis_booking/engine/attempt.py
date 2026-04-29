@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -46,6 +47,26 @@ _PER_SHOT_MIN_TIMEOUT_S = 0.2
 _GRACE_SEARCH_TIMEOUT_S = 5.0
 _GRACE_PER_SHOT_TIMEOUT_S = 5.0
 
+# Cloudflare per-IP rate-rule defensive backoff. Empirically (28.04 incident)
+# CF starts blocking ~75% of POSTs when burst exceeds ~30 RPS — slow and cap
+# at 2s so retry storms don't keep feeding the limiter.
+_CF_BACKOFF_INITIAL_MS = 100
+_CF_BACKOFF_CAP_MS = 2000
+# Other transport (timeout, connect_error) — lighter; these are usually
+# transient single-shot failures, not policy enforcement, so back off less.
+_OTHER_TRANSPORT_BACKOFF_INITIAL_MS = 50
+_OTHER_TRANSPORT_BACKOFF_CAP_MS = 500
+# Don't bother re-firing a shot if less than this remains before global deadline —
+# the per-shot timeout floor would just bounce immediately. Mark as final timeout.
+_RETRY_DEADLINE_MIN_MARGIN_S = 0.1
+_CLOUDFLARE_TRANSPORT_CAUSE = "cloudflare_challenge"
+
+
+def _exponential_backoff_ms(retry_count: int, initial_ms: int, cap_ms: int) -> int:
+    """retry_count is 1-based (first retry → initial_ms). Caps at cap_ms."""
+    delay_ms: int = initial_ms * (2 ** (retry_count - 1))
+    return min(cap_ms, delay_ms)
+
 
 @dataclass(frozen=True)
 class AttemptConfig:
@@ -81,6 +102,11 @@ class AttemptConfig:
     # purely for cache key construction + log readability — when None,
     # PollAttempt synthesises a fallback key from court_ids.
     pool_key: str | None = None
+    # Cap initial fan-out width: pick min(this, len(court_ids)) random court_ids
+    # from the pool. None = no cap (fire all court_ids — legacy behavior).
+    # Defensive measure against Cloudflare's per-IP rate-rule (~30 RPS) that
+    # blocks ~75% of POSTs in a 11-attempt × 7-court burst.
+    max_parallel_shots: int | None = None
 
     def __post_init__(self) -> None:
         if self.slot_dt_local.tzinfo is None:
@@ -141,17 +167,25 @@ class AttemptConfig:
             raise ValueError(
                 f"min_lead_time_hours must be <= 168.0 (1 week), got {self.min_lead_time_hours}"
             )
+        if self.max_parallel_shots is not None and self.max_parallel_shots < 1:
+            raise ValueError(
+                f"max_parallel_shots must be >= 1 if set, got {self.max_parallel_shots}"
+            )
 
     @property
     def effective_shots(self) -> int:
         """Эффективное число параллельных shots.
 
         Для pool (len(court_ids) > 1) — равно числу courts (по одному shot на
-        court); `parallel_shots` silently ignored. Для legacy (len==1) —
-        `parallel_shots` (дублирование на один и тот же court).
+        court), capped by max_parallel_shots if set; `parallel_shots` silently
+        ignored. Для legacy (len==1) — `parallel_shots` (дублирование на один
+        и тот же court).
         """
         if len(self.court_ids) > 1:
-            return len(self.court_ids)
+            base = len(self.court_ids)
+            if self.max_parallel_shots is not None:
+                return min(base, self.max_parallel_shots)
+            return base
         return self.parallel_shots
 
 
@@ -188,11 +222,20 @@ class BookingAttempt:
         client: AltegioClient,
         clock: Clock,
         store: BookingStore | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._config = config
         self._client = client
         self._clock = clock
         self._store = store
+        # SystemRandom for production (CSPRNG, no seedable state shared with code
+        # under test); injectable for reproducible tests of subset selection.
+        self._rng: random.Random = rng if rng is not None else random.SystemRandom()
+        # Subset of court_ids to fan out over for THIS attempt — populated once at
+        # _fire_and_retry start. Engine indexing logic (_spawn_shot, won_court_id
+        # mapping) reads this, NOT config.court_ids — so a capped attempt fires
+        # only on the chosen subset and never spills onto unselected courts.
+        self._active_court_ids: tuple[int, ...] = config.court_ids
         self._used = False
         self._attempt_id = uuid.uuid4().hex
         log_bindings: dict[str, object] = {
@@ -336,11 +379,28 @@ class BookingAttempt:
                 shots_fired=0,
             )
 
+        self._active_court_ids = self._select_active_court_ids()
+        if self._active_court_ids != self._config.court_ids:
+            self._log.info(
+                "active_court_subset_selected",
+                pool_size=len(self._config.court_ids),
+                subset_size=len(self._active_court_ids),
+                subset=list(self._active_court_ids),
+            )
+
         pending: set[asyncio.Task[BookingResponse]] = set()
         task_idx: dict[asyncio.Task[BookingResponse], int] = {}
         shots_fired = 0
         response_at_utc: datetime | None = None
         duplicates: list[BookingResponse] = []
+        # Per-shot transport-retry counter, used for exponential backoff so we
+        # don't keep slamming Cloudflare with immediate retries during a CF
+        # rate-rule block. Index = same `idx` used everywhere below.
+        retry_count_by_idx: dict[int, int] = {}
+        # Persist last transport cause across batches so a final no_pending
+        # timeout (e.g. all retries skipped near deadline) still carries the
+        # diagnostic cause for observability instead of bare None.
+        last_transport_cause: str | None = None
 
         for idx in range(self._config.effective_shots):
             task = self._spawn_shot(idx, deadline_at_mono)
@@ -388,7 +448,9 @@ class BookingAttempt:
                 unknown_retry_idxs: list[int] = []
                 not_open_retry_idxs: list[int] = []
                 not_open_code_seen: str | None = None
-                transport_retry_idxs: list[int] = []
+                # (idx, cause) — cause needed per-shot to pick the right
+                # exponential-backoff schedule (cloudflare vs other).
+                transport_retry_idx_causes: list[tuple[int, str]] = []
                 transport_cause_seen: str | None = None
 
                 for task in done:
@@ -411,8 +473,8 @@ class BookingAttempt:
                         )
                         if won_booking is None:
                             won_booking = booking
-                            won_court_id = self._config.court_ids[
-                                idx % len(self._config.court_ids)
+                            won_court_id = self._active_court_ids[
+                                idx % len(self._active_court_ids)
                             ]
                         else:
                             duplicates.append(booking)
@@ -449,9 +511,10 @@ class BookingAttempt:
                             status="transport",
                             cause=exc.cause,
                         )
-                        transport_retry_idxs.append(idx)
+                        transport_retry_idx_causes.append((idx, exc.cause))
                         if transport_cause_seen is None:
                             transport_cause_seen = exc.cause
+                        last_transport_cause = exc.cause
                         continue
 
                     if isinstance(exc, asyncio.CancelledError):
@@ -467,9 +530,10 @@ class BookingAttempt:
                         exc_type=type(exc).__name__,
                         error=str(exc),
                     )
-                    transport_retry_idxs.append(idx)
+                    transport_retry_idx_causes.append((idx, type(exc).__name__))
                     if transport_cause_seen is None:
                         transport_cause_seen = type(exc).__name__
+                    last_transport_cause = type(exc).__name__
 
                 # Phase 2: apply priority. Win beats all terminal errors (CR blocker).
                 if won_booking is not None:
@@ -565,7 +629,7 @@ class BookingAttempt:
                 if not_open_retry_idxs:
                     now_mono = self._clock.monotonic()
                     if now_mono > not_open_deadline_mono:
-                        if not transport_retry_idxs and not pending:
+                        if not transport_retry_idx_causes and not pending:
                             await self._cancel_all(pending)
                             if self._config.grace_polling is not None:
                                 grace_deadline_mono = (
@@ -614,7 +678,7 @@ class BookingAttempt:
                     task_idx[task] = idx
                     shots_fired += 1
 
-                if transport_retry_idxs:
+                if transport_retry_idx_causes:
                     now_mono = self._clock.monotonic()
                     if now_mono > deadline_at_mono:
                         await self._cancel_all(pending)
@@ -636,14 +700,64 @@ class BookingAttempt:
                             prearm_ok=prearm_ok,
                             shots_fired=shots_fired,
                         )
-                    for idx in transport_retry_idxs:
-                        task = self._spawn_shot(idx, deadline_at_mono)
+                    # Exponential backoff per shot: don't slam Cloudflare with
+                    # immediate retries during a rate-rule block. Backoff happens
+                    # inside each shot's task, so other shots keep racing.
+                    for idx, cause in transport_retry_idx_causes:
+                        retry_count_by_idx[idx] = retry_count_by_idx.get(idx, 0) + 1
+                        retry_count = retry_count_by_idx[idx]
+                        if cause == _CLOUDFLARE_TRANSPORT_CAUSE:
+                            delay_ms = _exponential_backoff_ms(
+                                retry_count,
+                                _CF_BACKOFF_INITIAL_MS,
+                                _CF_BACKOFF_CAP_MS,
+                            )
+                        else:
+                            delay_ms = _exponential_backoff_ms(
+                                retry_count,
+                                _OTHER_TRANSPORT_BACKOFF_INITIAL_MS,
+                                _OTHER_TRANSPORT_BACKOFF_CAP_MS,
+                            )
+                        delay_s = delay_ms / 1000.0
+                        # Skip retry if the backoff alone would push us past the
+                        # global deadline (with a tiny margin to spare). Mark the
+                        # shot as a final transport timeout — it doesn't get
+                        # re-spawned, so eventually pending drains.
+                        time_left_s = deadline_at_mono - now_mono
+                        if time_left_s < delay_s + _RETRY_DEADLINE_MIN_MARGIN_S:
+                            self._log.info(
+                                "transport_retry_skipped",
+                                idx=idx,
+                                cause=cause,
+                                retry_count=retry_count,
+                                delay_ms=delay_ms,
+                                time_left_s=time_left_s,
+                                reason="would_exceed_global_deadline",
+                            )
+                            continue
+                        self._log.info(
+                            "transport_retry_scheduled",
+                            idx=idx,
+                            cause=cause,
+                            retry_count=retry_count,
+                            delay_ms=delay_ms,
+                        )
+                        task = self._spawn_shot_with_backoff(
+                            idx, deadline_at_mono, delay_s
+                        )
                         pending.add(task)
                         task_idx[task] = idx
                         shots_fired += 1
 
             # pending empty: all shots finished but nothing decisive — treat as timeout.
-            self._log.info("result", status="timeout", reason="no_pending_no_result")
+            # Carry the last-seen transport cause so the operator can tell
+            # "we ran out of retry budget under CF block" from "no signal at all".
+            self._log.info(
+                "result",
+                status="timeout",
+                reason="no_pending_no_result",
+                transport_cause=last_transport_cause,
+            )
             return self._make_result(
                 status="timeout",
                 booking=None,
@@ -652,7 +766,7 @@ class BookingAttempt:
                 response_at_utc=response_at_utc,
                 start_mono=start_mono,
                 business_code=None,
-                transport_cause=None,
+                transport_cause=last_transport_cause,
                 prearm_ok=prearm_ok,
                 shots_fired=shots_fired,
             )
@@ -665,14 +779,54 @@ class BookingAttempt:
         now = self._clock.monotonic()
         remaining = deadline_at_mono - now
         timeout_s = self._per_shot_timeout(remaining)
-        # idx % len(court_ids): pool fan-outs одного shot на каждый court; legacy
-        # (len==1) — все shots дублируются на единственный court.
-        court_id = self._config.court_ids[idx % len(self._config.court_ids)]
+        # idx % len(active_court_ids): pool fan-outs одного shot на каждый
+        # активный court; legacy (len==1) — все shots дублируются на
+        # единственный court. Capped pool: idx ranges 0..effective_shots-1,
+        # which equals len(_active_court_ids) — modulo is identity here.
+        court_id = self._active_court_ids[idx % len(self._active_court_ids)]
         task = asyncio.create_task(
             self._shot(idx, court_id, timeout_s), name=f"shot-{idx}-court-{court_id}"
         )
         self._log.info("shot_posted", idx=idx, court_id=court_id, timeout_s=timeout_s)
         return task
+
+    def _spawn_shot_with_backoff(
+        self,
+        idx: int,
+        deadline_at_mono: float,
+        delay_s: float,
+    ) -> asyncio.Task[BookingResponse]:
+        """Sleep `delay_s` then fire shot `idx`. Per-shot delay does NOT block
+        sibling shots — each retry runs as its own task.
+        """
+        court_id = self._active_court_ids[idx % len(self._active_court_ids)]
+
+        async def _delayed_shot() -> BookingResponse:
+            if delay_s > 0:
+                await self._clock.sleep(delay_s)
+            now = self._clock.monotonic()
+            remaining = deadline_at_mono - now
+            timeout_s = self._per_shot_timeout(remaining)
+            self._log.info(
+                "shot_posted",
+                idx=idx,
+                court_id=court_id,
+                timeout_s=timeout_s,
+                backoff_delay_s=delay_s,
+            )
+            return await self._client.create_booking(
+                service_id=self._config.service_id,
+                staff_id=court_id,
+                slot_dt_local=self._config.slot_dt_local,
+                fullname=self._config.fullname,
+                phone=self._config.phone,
+                email=self._config.email,
+                timeout_s=timeout_s,
+            )
+
+        return asyncio.create_task(
+            _delayed_shot(), name=f"shot-{idx}-court-{court_id}-backoff"
+        )
 
     async def _shot(self, idx: int, court_id: int, timeout_s: float) -> BookingResponse:
         return await self._client.create_booking(
@@ -684,6 +838,24 @@ class BookingAttempt:
             email=self._config.email,
             timeout_s=timeout_s,
         )
+
+    def _select_active_court_ids(self) -> tuple[int, ...]:
+        """Pick a subset of court_ids to fan out over for this attempt.
+
+        Pool mode (len > 1): if max_parallel_shots is set and < pool size,
+        sample WITHOUT replacement to avoid duplicate shots on the same court.
+        Otherwise return the full pool (legacy behaviour).
+
+        Single-court (len == 1): always return as-is — parallel_shots controls
+        duplication onto the lone court via _spawn_shot's modulo, max_parallel_shots
+        is irrelevant.
+        """
+        all_ids = self._config.court_ids
+        cap = self._config.max_parallel_shots
+        if cap is None or len(all_ids) <= 1 or cap >= len(all_ids):
+            return all_ids
+        sampled = self._rng.sample(list(all_ids), cap)
+        return tuple(sampled)
 
     @staticmethod
     def _per_shot_timeout(remaining_to_deadline_s: float) -> float:
