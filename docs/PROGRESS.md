@@ -16,6 +16,7 @@
 | [#21](https://github.com/romer533/tennis-booking/pull/21) | **Cloudflare detector**: 6% запросов 28.04 fire получали `403 + text/html + Just a moment...` (Altegio за Cloudflare). Раньше → `unknown` → fallback `lost`. Теперь → `AltegioTransportError(cause="cloudflare_challenge")` → engine retry до global_deadline. 13 тестов |
 | [#22](https://github.com/romer533/tennis-booking/pull/22) | **Post-window poll**: после проигранного window phase scheduler сразу планировал следующую неделю, забывая текущий слот. Теперь — продолжает поллить `search_timeslots` каждые 120s до `slot - min_lead_time_hours`, ловя отмены. `PollAttempt` параметризован `post_window_mode`. Restart resilience через `_maybe_restart_post_window_poll`. Kill switch `TENNIS_POST_WINDOW_POLL_ENABLED` (default true). 24 теста |
 | [#23](https://github.com/romer533/tennis-booking/pull/23) | **Shared poll cache + jitter**: 21 polls делали `search_timeslots` одновременно каждые 120s — Cloudflare overload risk. `PollResultCache` с key `(date, pool)` дедуплицирует concurrent fetches через per-key `asyncio.Lock`. Initial jitter `U(0, interval/2)` + per-tick ±10% распределяет burst. Verified в проде: **10x reduction** (3 HTTP fetches per cycle вместо 21), **91.4% hit ratio**. 27 тестов |
+| [#24](https://github.com/romer533/tennis-booking/pull/24) | **cf-ray logging**: `_log_cloudflare_challenge` теперь пишет `cf_ray`, `cf_mitigated`, `cf_cache_status` headers. Подготовка к whitelist request админу Daulet — нужны конкретные cf-ray IDs для CF support trace. 4 теста |
 
 ## Замержено в main (MVP)
 
@@ -31,7 +32,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 1056 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1060 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
@@ -43,6 +44,7 @@
 - ✅ Manual booking подтверждён: record_id 645327563 (26.04 23:00 outdoor)
 - ✅ **Первая автоматическая бронь (27.04 02:00 UTC):** record_id 645621093 (roman, ср 29.04 07:00 indoor). 1 win из 11 attempts — остальные lost из-за N4 incident (см. ниже).
 - ✅ **Победа poll mode (28.04 01:59:55 UTC):** record_id 645847642 (roman, чт 30.04 07:00 indoor) — за 5 секунд до открытия окна. Бонус-дубль 645847641 на другом корте → отменён вручную (user предпочитает manual cancel вместо auto-cancel). 0/10 wins в window mode из-за Cloudflare 403 (см. PR #21).
+- ✅ **Третья победа (29.04 02:06:38 UTC):** record_id 646042815 (roman, пт 01.05 07:00 indoor) — выиграл уже после window phase, через ~6 минут после открытия. 1 win из 11 attempts — Cloudflare заблокировал 75% запросов (1680 hits на /book_record/, 0 на /search/timeslots/). См. N5 incident.
 
 ## Production incidents
 
@@ -52,6 +54,7 @@
 | 26.04 02:00 UTC | Mix snv + unknown → lost (grace blocked) | (1) Parser early-return на incomplete legacy stub `meta.errors=[{}]`; (2) grace требовал ALL snv | PR #19 (parser fall-through + grace ANY snv) |
 | 27.04 02:00 UTC | 10/11 attempts lost code=`unknown` | Altegio начал слать новый текст `"Currently, there are no staff members available for booking"` — `_derive_code_from_text` его не маппил | PR #20 (одна строка в `_TEXT_CODE_MAPPING`). Lesson: всегда смотреть raw body перед изобретением сложных fix'ов — чуть не ушёл в N3 v2 retry-релакс. |
 | 28.04 02:00 UTC | 0/10 window wins, 1 poll win + dup | (1) Altegio за Cloudflare antibot — 6% запросов получали 403+html challenge → engine fallback `lost code=unknown`. (2) Engine не отменяет дубликаты при multi-success fan-out (user предпочёл manual cancel). | PR #21 (Cloudflare detector → transport retry). Cancel-fix отложен. |
+| 29.04 02:00 UTC | 1 win (poll), 10 timeout (Cloudflare retry storm) | Cloudflare ввёл агрессивный rate-limit на `/book_record/` — 75% запросов (1680/2220) получили 403 за 8-секундное окно. PR #21 retry'ил каждый, raising sustained 6 RPS на одном IP. Research доказал: НЕ TLS fingerprint (curl_cffi=httpx 0/50 блоков), НЕ persistent IP rep (search/timeslots ОК) — а **rate-rule на write endpoint**. | PR #24 (cf-ray logging для CF support trace). Primary fix: whitelist IP `194.195.241.83` через Daulet admin. Phase 1.5 (Playwright) выкинут — не помогает rate-rule. |
 
 ## Phase 0 — Altegio API research
 
