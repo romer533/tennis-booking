@@ -170,6 +170,11 @@ class BookingRule(BaseModel):
     # 0.0 explicitly disables the guard for this booking. Upper bound 168h (1 week)
     # is a sanity cap — bigger values almost certainly mean a YAML typo.
     min_lead_time_hours: float | None = Field(default=None, ge=0.0, le=168.0)
+    # Cap fan-out width: at most this many random court_ids from the pool fire in
+    # parallel. None = no cap (existing behavior — fan out all court_ids). Used to
+    # keep our burst rate under Cloudflare's per-IP rate-rule threshold (~30 RPS).
+    # Clamped to len(court_ids) at runtime; >= 1 here, 0 would mean "fire nothing".
+    max_parallel_shots: int | None = Field(default=None, ge=1)
 
     @field_validator("name")
     @classmethod
@@ -272,6 +277,7 @@ class ResolvedBooking(BaseModel):
     poll: PollConfig | None = None
     grace_polling: GracePollingConfig | None = None
     min_lead_time_hours: float | None = Field(default=None, ge=0.0, le=168.0)
+    max_parallel_shots: int | None = Field(default=None, ge=1)
 
     @field_validator("court_ids", mode="before")
     @classmethod

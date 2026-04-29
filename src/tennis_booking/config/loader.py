@@ -281,6 +281,7 @@ def _resolve(
                 poll=rule.poll,
                 grace_polling=rule.grace_polling,
                 min_lead_time_hours=rule.min_lead_time_hours,
+                max_parallel_shots=rule.max_parallel_shots,
             )
         )
     return tuple(resolved)
