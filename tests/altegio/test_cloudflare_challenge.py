@@ -287,3 +287,102 @@ async def test_unknown_403_html_still_emits_warn(
     assert any(
         "altegio_unknown_error_body" in r.getMessage() for r in caplog.records
     )
+
+
+# ---- CF-trace headers (cf-ray, cf-mitigated, cf-cache-status) --------------
+# Нужны, чтобы при следующем инциденте можно было приложить cf-ray к письму
+# админу Daulet для whitelist-trace.
+
+
+def _cf_log_msg(caplog: pytest.LogCaptureFixture) -> str:
+    msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if "altegio_cloudflare_challenge_detected" in r.getMessage()
+    ]
+    assert len(msgs) == 1, f"expected exactly one cf log, got {msgs!r}"
+    return msgs[0]
+
+
+@respx.mock
+async def test_cloudflare_log_includes_cf_ray_when_present(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
+        return_value=httpx.Response(
+            403,
+            content=PROD_CLOUDFLARE_BODY.encode(),
+            headers={
+                "content-type": "text/html; charset=UTF-8",
+                "cf-ray": "9f3be836-FRA",
+            },
+        )
+    )
+    caplog.set_level(logging.INFO, logger="tennis_booking.altegio.client")
+    with pytest.raises(AltegioTransportError):
+        await _do_book()
+    msg = _cf_log_msg(caplog)
+    assert "cf_ray='9f3be836-FRA'" in msg
+
+
+@respx.mock
+async def test_cloudflare_log_includes_cf_mitigated_when_present(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
+        return_value=httpx.Response(
+            403,
+            content=PROD_CLOUDFLARE_BODY.encode(),
+            headers={
+                "content-type": "text/html; charset=UTF-8",
+                "cf-mitigated": "challenge",
+            },
+        )
+    )
+    caplog.set_level(logging.INFO, logger="tennis_booking.altegio.client")
+    with pytest.raises(AltegioTransportError):
+        await _do_book()
+    msg = _cf_log_msg(caplog)
+    assert "cf_mitigated='challenge'" in msg
+
+
+@respx.mock
+async def test_cloudflare_log_includes_cf_cache_status_when_present(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
+        return_value=httpx.Response(
+            403,
+            content=PROD_CLOUDFLARE_BODY.encode(),
+            headers={
+                "content-type": "text/html; charset=UTF-8",
+                "cf-cache-status": "DYNAMIC",
+            },
+        )
+    )
+    caplog.set_level(logging.INFO, logger="tennis_booking.altegio.client")
+    with pytest.raises(AltegioTransportError):
+        await _do_book()
+    msg = _cf_log_msg(caplog)
+    assert "cf_cache_status='DYNAMIC'" in msg
+
+
+@respx.mock
+async def test_cloudflare_log_handles_missing_headers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Когда CF headers нет — лог содержит None, не падает."""
+    respx.post(f"{BASE_URL}{BOOK_PATH}").mock(
+        return_value=httpx.Response(
+            403,
+            content=PROD_CLOUDFLARE_BODY.encode(),
+            headers={"content-type": "text/html; charset=UTF-8"},
+        )
+    )
+    caplog.set_level(logging.INFO, logger="tennis_booking.altegio.client")
+    with pytest.raises(AltegioTransportError):
+        await _do_book()
+    msg = _cf_log_msg(caplog)
+    assert "cf_ray=None" in msg
+    assert "cf_mitigated=None" in msg
+    assert "cf_cache_status=None" in msg
