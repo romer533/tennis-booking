@@ -571,11 +571,18 @@ def _log_cloudflare_challenge(
     response: httpx.Response, *, content_type: str
 ) -> None:
     body_len = len(response.text or "")
+    cf_ray = response.headers.get("cf-ray")
+    cf_mitigated = response.headers.get("cf-mitigated")
+    cf_cache_status = response.headers.get("cf-cache-status")
     _logger.info(
-        "altegio_cloudflare_challenge_detected http_status=%d content_type=%r body_len=%d",
+        "altegio_cloudflare_challenge_detected http_status=%d content_type=%r "
+        "body_len=%d cf_ray=%r cf_mitigated=%r cf_cache_status=%r",
         response.status_code,
         content_type,
         body_len,
+        cf_ray,
+        cf_mitigated,
+        cf_cache_status,
     )
 
 
