@@ -17,7 +17,8 @@
 | [#22](https://github.com/romer533/tennis-booking/pull/22) | **Post-window poll**: после проигранного window phase scheduler сразу планировал следующую неделю, забывая текущий слот. Теперь — продолжает поллить `search_timeslots` каждые 120s до `slot - min_lead_time_hours`, ловя отмены. `PollAttempt` параметризован `post_window_mode`. Restart resilience через `_maybe_restart_post_window_poll`. Kill switch `TENNIS_POST_WINDOW_POLL_ENABLED` (default true). 24 теста |
 | [#23](https://github.com/romer533/tennis-booking/pull/23) | **Shared poll cache + jitter**: 21 polls делали `search_timeslots` одновременно каждые 120s — Cloudflare overload risk. `PollResultCache` с key `(date, pool)` дедуплицирует concurrent fetches через per-key `asyncio.Lock`. Initial jitter `U(0, interval/2)` + per-tick ±10% распределяет burst. Verified в проде: **10x reduction** (3 HTTP fetches per cycle вместо 21), **91.4% hit ratio**. 27 тестов |
 | [#24](https://github.com/romer533/tennis-booking/pull/24) | **cf-ray logging**: `_log_cloudflare_challenge` теперь пишет `cf_ray`, `cf_mitigated`, `cf_cache_status` headers. Подготовка к whitelist request админу Daulet — нужны конкретные cf-ray IDs для CF support trace. 4 теста |
-| [#25](https://github.com/romer533/tennis-booking/pull/25) | **Defensive Cloudflare mitigation**: Daulet отказал в whitelist → переключаемся на снижение burst rate. (1) `BookingRule.max_parallel_shots: int\|None` — cap fan-out до random subset (config: 3). Initial burst 77 → 33 POSTs. (2) Exponential backoff на transport retry: CF cause 100/200/400/800/1600/2000ms cap 2000, other transport 50/100/200/400/500ms cap 500. Per-shot tasks — backoff не блокирует sibling. Skip retry если deadline-now < delay+0.1s. 25 тестов. Schedule.yaml на сервере обновлён `max_parallel_shots: 3` для всех 59 bookings. |
+| [#25](https://github.com/romer533/tennis-booking/pull/25) | **Defensive Cloudflare mitigation**: Daulet отказал в whitelist → переключаемся на снижение burst rate. (1) `BookingRule.max_parallel_shots: int\|None` — cap fan-out до random subset (config: 3). Initial burst 77 → 33 POSTs. (2) Exponential backoff на transport retry: CF cause 100/200/400/800/1600/2000ms cap 2000, other transport 50/100/200/400/500ms cap 500. Per-shot tasks — backoff не блокирует sibling. Skip retry если deadline-now < delay+0.1s. 25 тестов. Schedule.yaml на сервере обновлён `max_parallel_shots: 3` для всех 59 bookings. **Verified в проде (30.04 fire):** CF block rate 75% → 0.2% (375× reduction), 1 win через window phase впервые! |
+| [#26](https://github.com/romer533/tennis-booking/pull/26) | **Poll cap parallel_shots** (PR #25 follow-up): cap не применялся в `PollAttempt._fire_shots`. Production observation 30.04 11:23: post-window poll detected bookable → 7 shots без cap → 1 win + 1 duplicate (646335329). PR симметрично применяет cap в poll fire path. Все 4 phase теперь под cap (window, post-window, pre-window poll, post-window poll). 6 тестов |
 
 ## Замержено в main (MVP)
 
@@ -33,7 +34,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 1085 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1091 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
@@ -46,6 +47,8 @@
 - ✅ **Первая автоматическая бронь (27.04 02:00 UTC):** record_id 645621093 (roman, ср 29.04 07:00 indoor). 1 win из 11 attempts — остальные lost из-за N4 incident (см. ниже).
 - ✅ **Победа poll mode (28.04 01:59:55 UTC):** record_id 645847642 (roman, чт 30.04 07:00 indoor) — за 5 секунд до открытия окна. Бонус-дубль 645847641 на другом корте → отменён вручную (user предпочитает manual cancel вместо auto-cancel). 0/10 wins в window mode из-за Cloudflare 403 (см. PR #21).
 - ✅ **Третья победа (29.04 02:06:38 UTC):** record_id 646042815 (roman, пт 01.05 07:00 indoor) — выиграл уже после window phase, через ~6 минут после открытия. 1 win из 11 attempts — Cloudflare заблокировал 75% запросов (1680 hits на /book_record/, 0 на /search/timeslots/). См. N5 incident.
+- ✅ **Четвёртая победа (30.04 02:00:00.867 UTC):** record_id 646234414 (roman, сб 02.05 12:00 indoor) — **первый раз через WINDOW phase** за <1 секунды после открытия. PR #25 defensive снизил CF block с 75% до 0.2%.
+- ✅ **Пятая и шестая победы (30.04 11:21-11:23 UTC):** record_id 646334804 + 646335328 (askar, сб 02.05 21:00 + 20:00 indoor) — пойманы post-window poll'ом (PR #22) после real cancellations других людей. +1 duplicate 646335329 (court 1521555) — gap в PR #25 cap для poll path → закрыт PR #26.
 
 ## Production incidents
 
