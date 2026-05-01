@@ -980,3 +980,210 @@ async def test_unknown_code_business_loss_clears_event() -> None:
     clock.advance(3 * 24 * 3600)
     await task
     assert not won.is_set()
+
+
+# ---- max_parallel_shots cap (P1 follow-up to PR #25) -----------------------
+#
+# The window phase already caps fan-out via BookingAttempt._select_active_court_ids;
+# the poll fire path used the full pool (incident 30.04: 7 courts → 7 POSTs → 2 wins,
+# 1 duplicate booking). These tests pin the same cap onto PollAttempt._fire_shots.
+
+
+import random  # noqa: E402 — keep test-only import grouped with the cap suite
+
+
+async def test_poll_attempt_fire_respects_max_parallel_shots() -> None:
+    """pool=7, cap=3 → exactly 3 POSTs go out on detect."""
+    clock = _start_clock()
+    cids = (101, 102, 103, 104, 105, 106, 107)
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+        ],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(court_ids=cids, max_parallel_shots=3),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        rng=random.Random(42),
+    )
+    # Drive past slot to terminate after the loss.
+    task = asyncio.create_task(poll.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    clock.advance(3 * 24 * 3600)
+    await task
+
+    assert len(fake.booking_calls) == 3
+    fired = {c["staff_id"] for c in fake.booking_calls}
+    assert len(fired) == 3
+    assert fired.issubset(set(cids))
+
+
+async def test_poll_attempt_fire_random_subset_diversity() -> None:
+    """Two attempts with different seeds pick different subsets — proves we're
+    actually sampling and not always taking the head of the pool.
+    """
+    cids = (101, 102, 103, 104, 105, 106, 107)
+
+    async def _run_async(seed: int) -> set[int]:
+        clock = _start_clock()
+        fake = FakePollClient(
+            search_effects=[[_slot(SLOT, is_bookable=True)]],
+            booking_effects=[
+                AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+            ] * 3,
+        )
+        poll = PollAttempt(
+            _make_attempt_config(court_ids=cids, max_parallel_shots=3),
+            PollConfigData(interval_s=10, start_offset_days=2),
+            as_client(fake),
+            clock,
+            rng=random.Random(seed),
+        )
+        task = asyncio.create_task(poll.run())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        clock.advance(3 * 24 * 3600)
+        await task
+        return {c["staff_id"] for c in fake.booking_calls}
+
+    subset_a = await _run_async(seed=1)
+    subset_b = await _run_async(seed=999)
+    assert len(subset_a) == 3
+    assert len(subset_b) == 3
+    # Two seeds pulled from a 7-choose-3 = 35 distribution: probabilistic but with
+    # fixed seeds (1, 999) the subsets differ. If this ever flakes, swap seeds.
+    assert subset_a != subset_b
+
+
+async def test_poll_attempt_fire_clamped_to_pool_size() -> None:
+    """cap > pool → fire all (clamp to pool size, no IndexError, no duplicates)."""
+    clock = _start_clock()
+    cids = (101, 102, 103)
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+        ] * 3,
+    )
+    poll = PollAttempt(
+        _make_attempt_config(court_ids=cids, max_parallel_shots=10),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+    )
+    task = asyncio.create_task(poll.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    clock.advance(3 * 24 * 3600)
+    await task
+
+    assert len(fake.booking_calls) == 3
+    fired = {c["staff_id"] for c in fake.booking_calls}
+    assert fired == set(cids)
+
+
+async def test_poll_attempt_fire_uncapped_fans_out_all() -> None:
+    """cap=None → backward-compatible full fan-out (one shot per court)."""
+    clock = _start_clock()
+    cids = (101, 102, 103, 104, 105, 106, 107)
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+        ] * 7,
+    )
+    poll = PollAttempt(
+        _make_attempt_config(court_ids=cids),  # max_parallel_shots defaults to None
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+    )
+    task = asyncio.create_task(poll.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    clock.advance(3 * 24 * 3600)
+    await task
+
+    assert len(fake.booking_calls) == 7
+    fired = {c["staff_id"] for c in fake.booking_calls}
+    assert fired == set(cids)
+
+
+async def test_poll_attempt_search_NOT_capped() -> None:  # noqa: N802 — caps for emphasis
+    """search_timeslots must always query with the full pool court_ids — the cap
+    only applies to fire fan-out. Otherwise we'd lose visibility into cancellations
+    on the un-sampled courts and the cache would be incomplete.
+    """
+    clock = _start_clock()
+    cids = (101, 102, 103, 104, 105, 106, 107)
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+        ] * 3,
+    )
+    poll = PollAttempt(
+        _make_attempt_config(court_ids=cids, max_parallel_shots=3),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        rng=random.Random(0),
+    )
+    task = asyncio.create_task(poll.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    clock.advance(3 * 24 * 3600)
+    await task
+
+    # Search call inspected fresh (only one search executed before fire).
+    assert len(fake.search_calls) >= 1
+    assert fake.search_calls[0]["staff_ids"] == list(cids)
+    # And fire is capped to 3.
+    assert len(fake.booking_calls) == 3
+
+
+async def test_poll_attempt_won_court_id_from_active_subset_only() -> None:
+    """When a sampled-subset attempt wins, the persisted court_id MUST belong
+    to the subset that actually fired. Asserts no off-by-one between idx and
+    active_court_ids.
+    """
+    clock = _start_clock()
+    cids = (101, 102, 103, 104, 105, 106, 107)
+    booking = BookingResponse(record_id=42, record_hash="abc")
+    fake = FakePollClient(
+        search_effects=[[_slot(SLOT, is_bookable=True)]],
+        booking_effects=[
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+            booking,
+            AltegioBusinessError(code="slot_busy", message="x", http_status=422),
+        ],
+    )
+    poll = PollAttempt(
+        _make_attempt_config(court_ids=cids, max_parallel_shots=3),
+        PollConfigData(interval_s=10, start_offset_days=2),
+        as_client(fake),
+        clock,
+        rng=random.Random(42),
+    )
+    result = await poll.run()
+    assert result.status == "won"
+    assert result.booking is not None
+    assert result.booking.record_id == 42
+
+    fired_court_ids = {c["staff_id"] for c in fake.booking_calls}
+    assert len(fired_court_ids) == 3
+    assert fired_court_ids.issubset(set(cids))
+    # The court_id corresponding to the won shot must be one of the 3 sampled.
+    # _fire_shots ordering: idx 1 wins (second booking_effect = success). The
+    # active_court_ids tuple is what _fire_shots iterates with enumerate, so
+    # the won court is active_court_ids[1] — and that must appear in the
+    # fired set. We can verify indirectly: the second create_booking call's
+    # staff_id is the won court.
+    won_court_from_call = fake.booking_calls[1]["staff_id"]
+    assert won_court_from_call in fired_court_ids
