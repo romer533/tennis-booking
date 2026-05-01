@@ -121,6 +121,7 @@ class PollAttempt:
         post_window_mode: bool = False,
         cache: PollResultCache | None = None,
         pool_key: str | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
@@ -138,6 +139,14 @@ class PollAttempt:
         self._pool_key = pool_key if pool_key is not None else _synthesize_pool_key(
             attempt_config.court_ids
         )
+        # SystemRandom for production (CSPRNG, no seedable state); injectable
+        # for reproducible tests of subset selection. Reused across every fire
+        # within this attempt — but a fresh subset is picked per fire (see
+        # _select_active_court_ids) to spread load on successive cancellations.
+        # TODO(refactor): _select_active_court_ids is duplicated with
+        # BookingAttempt._select_active_court_ids. Extract to engine/_subset.py
+        # if a third caller appears.
+        self._rng: random.Random = rng if rng is not None else random.SystemRandom()
         self._used = False
         self._attempt_id = uuid.uuid4().hex
         log_bindings: dict[str, object] = {
@@ -414,6 +423,26 @@ class PollAttempt:
             return list(self._config.court_ids)
         return None
 
+    def _select_active_court_ids(self) -> tuple[int, ...]:
+        """Pick a subset of court_ids to fan out over for this fire.
+
+        Pool mode (len > 1): if max_parallel_shots is set and < pool size,
+        sample WITHOUT replacement to avoid duplicate POSTs on the same court
+        and to cap the per-fire request count (Cloudflare rate-rule defense
+        — see docs/incidents/2026-04-30-poll-fanout-duplicate.md context).
+        Otherwise return the full pool (legacy behaviour, backward compat).
+
+        Single-court (len == 1): always return as-is — there is nothing to
+        sample down to and parallel_shots semantics from BookingAttempt do
+        not apply to poll fire (poll always fires exactly one shot per court).
+        """
+        all_ids = self._config.court_ids
+        cap = self._config.max_parallel_shots
+        if cap is None or len(all_ids) <= 1 or cap >= len(all_ids):
+            return all_ids
+        sampled = self._rng.sample(list(all_ids), cap)
+        return tuple(sampled)
+
     def _is_too_close_to_slot(self) -> bool:
         """True если до slot_dt_local осталось меньше min_lead_time_hours.
 
@@ -449,14 +478,22 @@ class PollAttempt:
         fired_at_utc = self._clock.now_utc()
         self._log.info("poll_fire_at", fired_at_utc=fired_at_utc.isoformat())
 
+        active_court_ids = self._select_active_court_ids()
+        if active_court_ids != self._config.court_ids:
+            self._log.info(
+                "poll_active_court_subset_selected",
+                pool_size=len(self._config.court_ids),
+                subset_size=len(active_court_ids),
+                subset=list(active_court_ids),
+            )
+
         pending: set[asyncio.Task[BookingResponse]] = set()
         task_idx: dict[asyncio.Task[BookingResponse], int] = {}
         shots_fired = 0
         response_at_utc = None
         duplicates: list[BookingResponse] = []
 
-        for idx in range(len(self._config.court_ids)):
-            court_id = self._config.court_ids[idx]
+        for idx, court_id in enumerate(active_court_ids):
             task = asyncio.create_task(
                 self._client.create_booking(
                     service_id=self._config.service_id,
@@ -503,7 +540,7 @@ class PollAttempt:
                         )
                         if won_booking is None:
                             won_booking = booking
-                            won_court_id = self._config.court_ids[idx]
+                            won_court_id = active_court_ids[idx]
                         else:
                             duplicates.append(booking)
                         continue
