@@ -16,10 +16,20 @@ from .config import AltegioConfig
 from .errors import AltegioBusinessError, AltegioTransportError
 from .models import BookingAppointment, BookingRequest, BookingResponse, TimeSlot
 
-__all__ = ["ALMATY", "BOOK_RECORD_PATH", "SEARCH_TIMESLOTS_PATH", "AltegioClient"]
+__all__ = [
+    "ALMATY",
+    "BOOK_RECORD_PATH",
+    "CANCEL_BOOKING_PATH",
+    "SEARCH_TIMESLOTS_PATH",
+    "AltegioClient",
+]
 
 BOOK_RECORD_PATH = "/api/v1/book_record/{company_id}"
 SEARCH_TIMESLOTS_PATH = "/api/v1/booking/search/timeslots/"
+# Predicted from REST convention against the existing GET endpoint
+# documented in docs/api-research.md (Запрос E3). Real DELETE HAR not yet
+# captured — verify cancel_response_status_code in logs after first deploy.
+CANCEL_BOOKING_PATH = "/api/v1/booking/locations/{company_id}/attendances/{record_id}/"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=2.0)
 _DEFAULT_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
@@ -244,6 +254,119 @@ class AltegioClient:
         }
 
         return await self._post_search_timeslots(body, timeout_s=timeout_s)
+
+    async def cancel_booking(
+        self,
+        record_id: int,
+        record_hash: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        """DELETE booking. Best-effort cleanup of duplicates after a multi-success
+        fan-out — caller must NOT block the main win path on this.
+
+        Path predicted from REST convention against existing GET endpoint
+        documented in docs/api-research.md. Verify status codes in logs after
+        first production run.
+
+        Raises:
+            ValueError: pre-flight (record_id < 1 or empty hash).
+            AltegioBusinessError: 4xx (e.g. already cancelled, hash mismatch).
+            AltegioTransportError: 5xx, network error, Cloudflare challenge.
+        """
+        if not isinstance(record_id, int) or isinstance(record_id, bool):
+            raise ValueError(
+                f"record_id must be int, got {type(record_id).__name__}"
+            )
+        if record_id < 1:
+            raise ValueError(f"record_id must be >= 1, got {record_id}")
+        if not isinstance(record_hash, str) or not record_hash.strip():
+            raise ValueError("record_hash must be a non-empty string")
+
+        if self._config.dry_run:
+            _logger.info(
+                "[DRY RUN] would DELETE %s record_id=%d",
+                CANCEL_BOOKING_PATH.format(
+                    company_id=self._config.company_id, record_id=record_id
+                ),
+                record_id,
+            )
+            return
+
+        await self._delete_booking(record_id, record_hash, timeout_s=timeout_s)
+
+    async def _delete_booking(
+        self,
+        record_id: int,
+        record_hash: str,
+        *,
+        timeout_s: float | None,
+    ) -> None:
+        http = self._require_http()
+        path = CANCEL_BOOKING_PATH.format(
+            company_id=self._config.company_id, record_id=record_id
+        )
+        params = {
+            "hash": record_hash,
+            "bookform_id": str(self._config.bookform_id),
+        }
+        headers = {
+            "Authorization": f"Bearer {self._config.bearer_token.get_secret_value()}",
+            "accept": "application/json, text/plain, */*",
+        }
+        kwargs: dict[str, Any] = {"params": params, "headers": headers}
+        if timeout_s is not None:
+            kwargs["timeout"] = httpx.Timeout(
+                connect=_DEFAULT_TIMEOUT.connect,
+                read=timeout_s,
+                write=timeout_s,
+                pool=_DEFAULT_TIMEOUT.pool,
+            )
+
+        try:
+            response = await http.delete(path, **kwargs)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.RemoteProtocolError,
+            httpx.TransportError,
+        ) as e:
+            raise AltegioTransportError(type(e).__name__) from e
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — narrow to transport for unknown httpx issues
+            raise AltegioTransportError(f"{type(e).__name__}: {e}") from e
+
+        self._parse_cancel_response(response)
+
+    @staticmethod
+    def _parse_cancel_response(response: httpx.Response) -> None:
+        status = response.status_code
+
+        if 500 <= status < 600:
+            raise AltegioTransportError(f"server error {status}")
+
+        content_type = response.headers.get("content-type", "")
+        is_json = "application/json" in content_type.lower()
+
+        if _is_cloudflare_challenge(response, status=status, content_type=content_type):
+            _log_cloudflare_challenge(response, content_type=content_type)
+            raise AltegioTransportError("cloudflare_challenge")
+
+        if 200 <= status < 300:
+            # 200/204 — body may be empty; we don't need it.
+            return
+
+        if 400 <= status < 500:
+            code, message = _extract_business_error(response, is_json=is_json)
+            if status == 401 and code == "unknown":
+                code = "unauthorized"
+            raise AltegioBusinessError(code=code, message=message, http_status=status)
+
+        raise AltegioTransportError(f"unexpected status {status}")
 
     @staticmethod
     def _validate_search_inputs(staff_ids: list[int]) -> None:
