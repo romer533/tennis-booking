@@ -1,4 +1,4 @@
-from .client import ALMATY, BOOK_RECORD_PATH, AltegioClient
+from .client import ALMATY, BOOK_RECORD_PATH, CANCEL_BOOKING_PATH, AltegioClient
 from .config import AltegioConfig
 from .errors import (
     AltegioBusinessError,
@@ -11,6 +11,7 @@ from .models import BookingAppointment, BookingRequest, BookingResponse, TimeSlo
 __all__ = [
     "ALMATY",
     "BOOK_RECORD_PATH",
+    "CANCEL_BOOKING_PATH",
     "AltegioBusinessError",
     "AltegioClient",
     "AltegioConfig",

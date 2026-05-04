@@ -122,6 +122,7 @@ class PollAttempt:
         cache: PollResultCache | None = None,
         pool_key: str | None = None,
         rng: random.Random | None = None,
+        cancel_duplicates_enabled: bool = True,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
@@ -131,6 +132,7 @@ class PollAttempt:
         self._won_event = won_event if won_event is not None else asyncio.Event()
         self._post_window_mode = post_window_mode
         self._cache = cache
+        self._cancel_duplicates_enabled = cancel_duplicates_enabled
         # When pool_key is not provided, fall back to a deterministic synthetic
         # key derived from the full court_ids tuple. This guarantees that polls
         # which differ ONLY by profile (same date, same staff_ids) coalesce,
@@ -492,6 +494,9 @@ class PollAttempt:
         shots_fired = 0
         response_at_utc = None
         duplicates: list[BookingResponse] = []
+        # Parallel to `duplicates`: court_id of each dup so cancel_logger can
+        # attribute which court the stranded booking was made on.
+        dup_courts: list[int | None] = []
 
         for idx, court_id in enumerate(active_court_ids):
             task = asyncio.create_task(
@@ -543,6 +548,7 @@ class PollAttempt:
                             won_court_id = active_court_ids[idx]
                         else:
                             duplicates.append(booking)
+                            dup_courts.append(active_court_ids[idx])
                         continue
                     if isinstance(exc, AltegioBusinessError):
                         self._log.info(
@@ -593,6 +599,7 @@ class PollAttempt:
                     record_id=won_booking.record_id,
                     duplicates=len(duplicates),
                 )
+                await self._cancel_duplicates(duplicates, dup_courts)
                 return self._make_result(
                     status="won",
                     booking=won_booking,
@@ -695,6 +702,64 @@ class PollAttempt:
             self._log.exception(
                 "persistence_append_failed", record_id=booking.record_id
             )
+
+    async def _cancel_duplicates(
+        self,
+        duplicates: list[BookingResponse],
+        dup_courts: list[int | None],
+    ) -> None:
+        """Best-effort DELETE of stranded duplicates after a poll-fire win.
+        Failures are logged with `cancel_response_status_code` and never raised
+        — the main `won` outcome must always be returned to the caller.
+        """
+        if not self._cancel_duplicates_enabled:
+            if duplicates:
+                self._log.info(
+                    "duplicates_cancel_skipped",
+                    count=len(duplicates),
+                    reason="feature_disabled",
+                )
+            return
+        for booking, court in zip(duplicates, dup_courts, strict=False):
+            try:
+                await self._client.cancel_booking(
+                    booking.record_id,
+                    booking.record_hash,
+                    timeout_s=5.0,
+                )
+                self._log.info(
+                    "duplicate_cancelled",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    cancel_response_status_code=200,
+                )
+            except AltegioBusinessError as exc:
+                self._log.warning(
+                    "duplicate_cancel_business_error",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    code=exc.code,
+                    message=exc.message,
+                    http_status=exc.http_status,
+                    cancel_response_status_code=exc.http_status,
+                )
+            except AltegioTransportError as exc:
+                self._log.warning(
+                    "duplicate_cancel_transport_error",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    cause=exc.cause,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — never crash main path on cancel
+                self._log.warning(
+                    "duplicate_cancel_network_error",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    exc_type=type(exc).__name__,
+                    error=str(exc),
+                )
 
     def _make_result(
         self,

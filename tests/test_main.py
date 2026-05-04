@@ -174,6 +174,29 @@ def test_post_window_poll_env_explicit_true() -> None:
     assert cli._parse_post_window_poll_enabled("maybe") is True
 
 
+def test_cancel_duplicates_env_default_true() -> None:
+    """No env → enabled=True (default-on; flag is opt-out)."""
+    assert cli._parse_cancel_duplicates_enabled(None) is True
+
+
+def test_cancel_duplicates_env_explicit_false() -> None:
+    assert cli._parse_cancel_duplicates_enabled("0") is False
+    assert cli._parse_cancel_duplicates_enabled("false") is False
+    assert cli._parse_cancel_duplicates_enabled(" FALSE ") is False
+    assert cli._parse_cancel_duplicates_enabled("no") is False
+    assert cli._parse_cancel_duplicates_enabled("off") is False
+    assert cli._parse_cancel_duplicates_enabled("") is False
+
+
+def test_cancel_duplicates_env_explicit_true() -> None:
+    """Anything not in the explicit falsy set stays True — typos must not
+    silently disable the feature."""
+    assert cli._parse_cancel_duplicates_enabled("1") is True
+    assert cli._parse_cancel_duplicates_enabled("true") is True
+    assert cli._parse_cancel_duplicates_enabled("yes") is True
+    assert cli._parse_cancel_duplicates_enabled("maybe") is True
+
+
 def test_install_signal_handlers_on_windows_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

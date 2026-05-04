@@ -149,6 +149,18 @@ def _parse_post_window_poll_enabled(env_value: str | None) -> bool:
     return normalized not in ("0", "false", "no", "off", "")
 
 
+def _parse_cancel_duplicates_enabled(env_value: str | None) -> bool:
+    """TENNIS_CANCEL_DUPLICATES_ENABLED feature flag for auto-cancel of
+    duplicate bookings on multi-success fan-out. Default True; only explicit
+    falsy strings disable it. Same fail-safe parse rules as the other
+    boolean env helpers — typos stay True.
+    """
+    if env_value is None:
+        return True
+    normalized = env_value.strip().lower()
+    return normalized not in ("0", "false", "no", "off", "")
+
+
 def _install_signal_handlers(
     event_loop: asyncio.AbstractEventLoop,
     scheduler_loop: SchedulerLoop,
@@ -221,6 +233,15 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "— post-window cancellation polling is disabled"
         )
 
+    cancel_duplicates_enabled = _parse_cancel_duplicates_enabled(
+        os.environ.get("TENNIS_CANCEL_DUPLICATES_ENABLED")
+    )
+    if not cancel_duplicates_enabled:
+        logger.warning(
+            "cancel_duplicates_enabled=False (TENNIS_CANCEL_DUPLICATES_ENABLED env override) "
+            "— duplicate bookings will only be logged, not cancelled"
+        )
+
     try:
         min_lead_time_hours = _parse_min_lead_time_hours(
             os.environ.get("TENNIS_MIN_LEAD_TIME_HOURS")
@@ -257,6 +278,7 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             store=store,
             min_lead_time_hours=min_lead_time_hours,
             post_window_poll_enabled=post_window_poll_enabled,
+            cancel_duplicates_enabled=cancel_duplicates_enabled,
         )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)

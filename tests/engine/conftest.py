@@ -88,15 +88,18 @@ class FakeAltegioClient:
         config: AltegioConfig | None = None,
         prearm_effect: BaseException | Callable[[], Awaitable[None]] | None = None,
         search_effects: list[SearchEffect] | None = None,
+        cancel_effects: list[BaseException | None] | None = None,
     ) -> None:
         self._side_effects: list[SideEffect] = list(side_effects or [])
         self._config = config or _default_config()
         self._prearm_effect = prearm_effect
         self._search_effects: list[SearchEffect] = list(search_effects or [])
+        self._cancel_effects: list[BaseException | None] = list(cancel_effects or [])
         self._default_side_effect: SideEffect | None = None
         self.create_booking_calls: list[dict[str, Any]] = []
         self.prearm_calls: int = 0
         self.search_timeslots_calls: list[dict[str, Any]] = []
+        self.cancel_booking_calls: list[dict[str, Any]] = []
 
     @property
     def config(self) -> AltegioConfig:
@@ -159,6 +162,31 @@ class FakeAltegioClient:
 
     def add_search(self, *effects: SearchEffect) -> None:
         self._search_effects.extend(effects)
+
+    def add_cancel(self, *effects: BaseException | None) -> None:
+        self._cancel_effects.extend(effects)
+
+    async def cancel_booking(
+        self,
+        record_id: int,
+        record_hash: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        call = {
+            "record_id": record_id,
+            "record_hash": record_hash,
+            "timeout_s": timeout_s,
+        }
+        self.cancel_booking_calls.append(call)
+        if not self._cancel_effects:
+            await asyncio.sleep(0)
+            return
+        effect = self._cancel_effects.pop(0)
+        await asyncio.sleep(0)
+        if effect is None:
+            return
+        raise effect
 
     async def search_timeslots(
         self,
@@ -226,12 +254,14 @@ def fake_client() -> Callable[..., FakeAltegioClient]:
         dry_run: bool = False,
         prearm_effect: BaseException | Callable[[], Awaitable[None]] | None = None,
         search_effects: list[SearchEffect] | None = None,
+        cancel_effects: list[BaseException | None] | None = None,
     ) -> FakeAltegioClient:
         return FakeAltegioClient(
             side_effects=side_effects,
             config=_default_config(dry_run=dry_run),
             prearm_effect=prearm_effect,
             search_effects=search_effects,
+            cancel_effects=cancel_effects,
         )
 
     return _make

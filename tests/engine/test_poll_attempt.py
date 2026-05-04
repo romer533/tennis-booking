@@ -53,13 +53,16 @@ class FakePollClient:
         *,
         search_effects: list[SearchEffect] | None = None,
         booking_effects: list[SideEffect] | None = None,
+        cancel_effects: list[BaseException | None] | None = None,
         config: AltegioConfig | None = None,
     ) -> None:
         self._search_effects: list[SearchEffect] = list(search_effects or [])
         self._booking_effects: list[SideEffect] = list(booking_effects or [])
+        self._cancel_effects: list[BaseException | None] = list(cancel_effects or [])
         self._config = config or _config()
         self.search_calls: list[dict[str, Any]] = []
         self.booking_calls: list[dict[str, Any]] = []
+        self.cancel_calls: list[dict[str, Any]] = []
 
     @property
     def config(self) -> AltegioConfig:
@@ -115,6 +118,28 @@ class FakePollClient:
         if isinstance(effect, BaseException):
             raise effect
         return await effect()
+
+    async def cancel_booking(
+        self,
+        record_id: int,
+        record_hash: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        self.cancel_calls.append(
+            {
+                "record_id": record_id,
+                "record_hash": record_hash,
+                "timeout_s": timeout_s,
+            }
+        )
+        await asyncio.sleep(0)
+        if not self._cancel_effects:
+            return
+        effect = self._cancel_effects.pop(0)
+        if effect is None:
+            return
+        raise effect
 
 
 def as_client(fake: FakePollClient) -> AltegioClient:

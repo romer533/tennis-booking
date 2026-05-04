@@ -118,8 +118,27 @@ def _default_attempt_factory(
     return BookingAttempt(config, client, clock, store=store)
 
 
+def _make_default_attempt_factory(cancel_duplicates_enabled: bool) -> AttemptFactory:
+    def _factory(
+        config: AttemptConfig,
+        client: AltegioClient,
+        clock: Clock,
+        store: BookingStore | None,
+    ) -> BookingAttempt:
+        return BookingAttempt(
+            config,
+            client,
+            clock,
+            store=store,
+            cancel_duplicates_enabled=cancel_duplicates_enabled,
+        )
+
+    return _factory
+
+
 def _make_default_poll_attempt_factory(
     cache: PollResultCache | None,
+    cancel_duplicates_enabled: bool,
 ) -> PollAttemptFactory:
     """Build the production PollAttempt factory. Closes over the loop's shared
     `PollResultCache` so every spawned PollAttempt consults the same cache —
@@ -143,6 +162,7 @@ def _make_default_poll_attempt_factory(
             store=store,
             cache=cache,
             pool_key=config.pool_key,
+            cancel_duplicates_enabled=cancel_duplicates_enabled,
         )
 
     return _factory
@@ -150,6 +170,7 @@ def _make_default_poll_attempt_factory(
 
 def _make_default_post_window_poll_factory(
     cache: PollResultCache | None,
+    cancel_duplicates_enabled: bool,
 ) -> PostWindowPollFactory:
     def _factory(
         config: AttemptConfig,
@@ -169,6 +190,7 @@ def _make_default_post_window_poll_factory(
             post_window_mode=True,
             cache=cache,
             pool_key=config.pool_key,
+            cancel_duplicates_enabled=cancel_duplicates_enabled,
         )
 
     return _factory
@@ -232,6 +254,7 @@ class SchedulerLoop:
         min_lead_time_hours: float = DEFAULT_MIN_LEAD_TIME_HOURS,
         post_window_poll_interval_s: int = DEFAULT_POST_WINDOW_POLL_INTERVAL_S,
         post_window_poll_enabled: bool = True,
+        cancel_duplicates_enabled: bool = True,
     ) -> None:
         if min_lead_time_hours < 0.0 or min_lead_time_hours > 168.0:
             raise ValueError(
@@ -252,8 +275,11 @@ class SchedulerLoop:
         self._min_lead_time_hours = min_lead_time_hours
         self._post_window_poll_interval_s = post_window_poll_interval_s
         self._post_window_poll_enabled = post_window_poll_enabled
+        self._cancel_duplicates_enabled = cancel_duplicates_enabled
         self._attempt_factory: AttemptFactory = (
-            attempt_factory if attempt_factory is not None else _default_attempt_factory
+            attempt_factory
+            if attempt_factory is not None
+            else _make_default_attempt_factory(cancel_duplicates_enabled)
         )
         # Shared poll-result cache for the lifetime of this SchedulerLoop.
         # TTL == post_window_poll_interval_s (the default poll cadence). Both
@@ -267,12 +293,16 @@ class SchedulerLoop:
         self._poll_attempt_factory: PollAttemptFactory = (
             poll_attempt_factory
             if poll_attempt_factory is not None
-            else _make_default_poll_attempt_factory(self._poll_cache)
+            else _make_default_poll_attempt_factory(
+                self._poll_cache, cancel_duplicates_enabled
+            )
         )
         self._post_window_poll_factory: PostWindowPollFactory = (
             post_window_poll_factory
             if post_window_poll_factory is not None
-            else _make_default_post_window_poll_factory(self._poll_cache)
+            else _make_default_post_window_poll_factory(
+                self._poll_cache, cancel_duplicates_enabled
+            )
         )
         self._ntp_checker: NTPChecker = (
             ntp_checker if ntp_checker is not None else _default_ntp_checker(ntp_threshold_ms)

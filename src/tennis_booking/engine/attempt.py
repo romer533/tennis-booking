@@ -223,11 +223,14 @@ class BookingAttempt:
         clock: Clock,
         store: BookingStore | None = None,
         rng: random.Random | None = None,
+        *,
+        cancel_duplicates_enabled: bool = True,
     ) -> None:
         self._config = config
         self._client = client
         self._clock = clock
         self._store = store
+        self._cancel_duplicates_enabled = cancel_duplicates_enabled
         # SystemRandom for production (CSPRNG, no seedable state shared with code
         # under test); injectable for reproducible tests of subset selection.
         self._rng: random.Random = rng if rng is not None else random.SystemRandom()
@@ -393,6 +396,10 @@ class BookingAttempt:
         shots_fired = 0
         response_at_utc: datetime | None = None
         duplicates: list[BookingResponse] = []
+        # Parallel to `duplicates`: court_id of each dup so the cancel logger
+        # can attribute which court the stranded booking was made on. None
+        # entries are tolerated (legacy callers / unmapped indices).
+        dup_courts: list[int | None] = []
         # Per-shot transport-retry counter, used for exponential backoff so we
         # don't keep slamming Cloudflare with immediate retries during a CF
         # rate-rule block. Index = same `idx` used everywhere below.
@@ -471,13 +478,15 @@ class BookingAttempt:
                             status="success",
                             record_id=booking.record_id,
                         )
+                        shot_court_id = self._active_court_ids[
+                            idx % len(self._active_court_ids)
+                        ]
                         if won_booking is None:
                             won_booking = booking
-                            won_court_id = self._active_court_ids[
-                                idx % len(self._active_court_ids)
-                            ]
+                            won_court_id = shot_court_id
                         else:
                             duplicates.append(booking)
+                            dup_courts.append(shot_court_id)
                         continue
 
                     if isinstance(exc, AltegioBusinessError):
@@ -537,7 +546,9 @@ class BookingAttempt:
 
                 # Phase 2: apply priority. Win beats all terminal errors (CR blocker).
                 if won_booking is not None:
-                    await self._drain_for_duplicates(pending, duplicates)
+                    await self._drain_for_duplicates(
+                        pending, duplicates, dup_courts, task_idx
+                    )
                     assert won_court_id is not None  # set together with won_booking
                     await self._persist_win(won_booking, won_court_id, "window")
                     self._log.info(
@@ -546,6 +557,7 @@ class BookingAttempt:
                         record_id=won_booking.record_id,
                         duplicates=len(duplicates),
                     )
+                    await self._cancel_duplicates(duplicates, dup_courts)
                     return self._make_result(
                         status="won",
                         booking=won_booking,
@@ -899,12 +911,82 @@ class BookingAttempt:
                 "persistence_append_failed", record_id=booking.record_id
             )
 
+    async def _cancel_duplicates(
+        self,
+        duplicates: list[BookingResponse],
+        dup_courts: list[int | None],
+    ) -> None:
+        """Best-effort DELETE of stranded duplicate bookings produced by a
+        multi-success fan-out.
+
+        Failures are logged with `cancel_response_status_code` and never raised
+        — the main `won` outcome must always be returned to the caller. When
+        the feature flag is off, only a summary log is emitted with no HTTP
+        traffic.
+        """
+        if not self._cancel_duplicates_enabled:
+            if duplicates:
+                self._log.info(
+                    "duplicates_cancel_skipped",
+                    count=len(duplicates),
+                    reason="feature_disabled",
+                )
+            return
+        for booking, court in zip(duplicates, dup_courts, strict=False):
+            try:
+                await self._client.cancel_booking(
+                    booking.record_id,
+                    booking.record_hash,
+                    timeout_s=5.0,
+                )
+                self._log.info(
+                    "duplicate_cancelled",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    cancel_response_status_code=200,
+                )
+            except AltegioBusinessError as exc:
+                self._log.warning(
+                    "duplicate_cancel_business_error",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    code=exc.code,
+                    message=exc.message,
+                    http_status=exc.http_status,
+                    cancel_response_status_code=exc.http_status,
+                )
+            except AltegioTransportError as exc:
+                self._log.warning(
+                    "duplicate_cancel_transport_error",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    cause=exc.cause,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — never crash main path on cancel
+                self._log.warning(
+                    "duplicate_cancel_network_error",
+                    record_id=booking.record_id,
+                    court_id=court,
+                    exc_type=type(exc).__name__,
+                    error=str(exc),
+                )
+
     async def _drain_for_duplicates(
         self,
         pending: set[asyncio.Task[BookingResponse]],
         duplicates: list[BookingResponse],
+        dup_courts: list[int | None],
+        task_idx: dict[asyncio.Task[BookingResponse], int],
     ) -> None:
-        """После win — cancel остальные, но собрать уже-готовые success как duplicates."""
+        """После win — cancel остальные, но собрать уже-готовые success как duplicates.
+
+        Каждому собранному дубликату ставим в соответствие court_id через
+        task_idx → _active_court_ids, чтобы cancel-логика могла залогировать
+        корт. Несопоставленные задачи (теоретически невозможно, но defensive)
+        получают None.
+        """
         if not pending:
             return
         # Freeze iteration order: `pending` is a set, so we must materialise it before
@@ -920,6 +1002,13 @@ class BookingAttempt:
                 continue
             if isinstance(res, BookingResponse):
                 duplicates.append(res)
+                idx = task_idx.get(task)
+                if idx is not None and self._active_court_ids:
+                    dup_courts.append(
+                        self._active_court_ids[idx % len(self._active_court_ids)]
+                    )
+                else:
+                    dup_courts.append(None)
         pending.clear()
 
     # --- grace mode -----------------------------------------------------
@@ -1100,6 +1189,9 @@ class BookingAttempt:
         task_idx: dict[asyncio.Task[BookingResponse], int] = {}
         local_shots_fired = shots_fired_so_far
         local_response_at_utc: datetime | None = None
+        # Grace-mode dups appended to caller's `duplicates` list — track courts
+        # in a parallel local list so we can cancel them after the grace win.
+        grace_dup_courts: list[int | None] = []
 
         for idx, court_id in enumerate(self._config.court_ids):
             task = asyncio.create_task(
@@ -1144,6 +1236,7 @@ class BookingAttempt:
                             won_court_id = self._config.court_ids[idx]
                         else:
                             duplicates.append(booking)
+                            grace_dup_courts.append(self._config.court_ids[idx])
                         continue
 
                     if isinstance(exc, AltegioBusinessError):
@@ -1200,6 +1293,12 @@ class BookingAttempt:
                     record_id=won_booking.record_id,
                     duplicates=len(duplicates),
                 )
+                # Cancel the dups produced *in this grace fire*. We pass only
+                # the locally-tracked subset (grace_dup_courts) — earlier dups
+                # from the original window fire have already been processed
+                # before grace started.
+                grace_dups_only = duplicates[len(duplicates) - len(grace_dup_courts):]
+                await self._cancel_duplicates(grace_dups_only, grace_dup_courts)
                 return self._make_result(
                     status="won",
                     booking=won_booking,
