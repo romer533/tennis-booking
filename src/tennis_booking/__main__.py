@@ -25,6 +25,7 @@ from tennis_booking.common.clock import SystemClock
 from tennis_booking.config.errors import ConfigError
 from tennis_booking.config.loader import load_app_config
 from tennis_booking.obs import setup_logging
+from tennis_booking.obs.telegram import TelegramNotifier, disabled_notifier
 from tennis_booking.persistence.cli import add_import_record_subparser, run_import_record
 from tennis_booking.persistence.store import FileBookingStore
 from tennis_booking.scheduler.loop import SchedulerLoop
@@ -161,6 +162,51 @@ def _parse_cancel_duplicates_enabled(env_value: str | None) -> bool:
     return normalized not in ("0", "false", "no", "off", "")
 
 
+def _parse_telegram_enabled(env_value: str | None) -> bool:
+    """TELEGRAM_NOTIFICATIONS_ENABLED — opt-in feature flag.
+
+    Inverse of the other boolean helpers: defaults to FALSE so a fresh deploy
+    does not start spamming chats until the operator explicitly turns it on
+    (and verifies bot_token + chat_ids are populated). Only explicit truthy
+    strings enable it; everything else (including unrecognised typos) stays
+    disabled — typos must NOT silently start sending notifications.
+    """
+    if env_value is None:
+        return False
+    normalized = env_value.strip().lower()
+    return normalized in ("1", "true", "yes", "on")
+
+
+def _build_telegram_notifier(
+    env: dict[str, str], logger: logging.Logger
+) -> TelegramNotifier:
+    """Construct the production TelegramNotifier from env. Logs a one-line
+    init summary at startup so the operator can see in journalctl whether
+    notifications are live, and why they are off when they are."""
+    enabled = _parse_telegram_enabled(env.get("TELEGRAM_NOTIFICATIONS_ENABLED"))
+    bot_token_raw = env.get("TELEGRAM_BOT_TOKEN", "").strip()
+    bot_token = bot_token_raw or None
+    personal = env.get("TELEGRAM_PERSONAL_CHAT_ID", "").strip()
+    group = env.get("TELEGRAM_GROUP_CHAT_ID", "").strip()
+    chat_ids: tuple[str, ...] = tuple(c for c in (personal, group) if c)
+
+    if not enabled:
+        logger.info("telegram_notifier_disabled reason=flag_off")
+        return disabled_notifier()
+    if bot_token is None:
+        logger.warning("telegram_notifier_disabled reason=missing_bot_token")
+        return disabled_notifier()
+    if not chat_ids:
+        logger.warning("telegram_notifier_disabled reason=no_chat_ids")
+        return disabled_notifier()
+
+    logger.info(
+        "telegram_notifier_initialized enabled=true chat_ids_count=%d",
+        len(chat_ids),
+    )
+    return TelegramNotifier(bot_token=bot_token, chat_ids=chat_ids, enabled=True)
+
+
 def _install_signal_handlers(
     event_loop: asyncio.AbstractEventLoop,
     scheduler_loop: SchedulerLoop,
@@ -269,6 +315,8 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return EXIT_ERROR
     logger.info("store_initialised: path=%s", store_path)
 
+    notifier = _build_telegram_notifier(dict(os.environ), logger)
+
     async with AltegioClient(altegio_config) as client:
         scheduler_loop = SchedulerLoop(
             app_config,
@@ -279,6 +327,7 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             min_lead_time_hours=min_lead_time_hours,
             post_window_poll_enabled=post_window_poll_enabled,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
+            notifier=notifier,
         )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)
