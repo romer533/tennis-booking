@@ -5,6 +5,7 @@ from datetime import datetime
 import httpx
 import pytest
 import respx
+import structlog
 
 from tennis_booking.altegio import BookingResponse
 from tennis_booking.common.tz import ALMATY
@@ -217,3 +218,125 @@ async def test_notifier_continues_to_second_chat_after_first_fails() -> None:
     n = TelegramNotifier(bot_token=_TOKEN, chat_ids=(_CHAT_A, _CHAT_B), enabled=True)
     await n.send("hello")
     assert route.call_count == 2
+
+
+# ---- Security regressions -------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_log_does_not_contain_bot_token_on_4xx() -> None:
+    """A 4xx response from Telegram must not leak the bot token in WARN logs.
+
+    httpx.HTTPStatusError carries the request URL inside its message, which
+    contains `bot<TOKEN>` in plaintext. Logging `str(exc)` would dump it to
+    journalctl. We must log only sanitized fields.
+
+    The body is also passed through `_redact_token` defensively in case Telegram
+    or an intermediate proxy echoes the URL in the response body.
+    """
+    # Body intentionally echoes the bot URL to exercise the redactor path.
+    body_with_token = (
+        f"401 Unauthorized for {_TG_API}/bot{_TOKEN}/sendMessage"
+    )
+    respx.post(f"{_TG_API}/bot{_TOKEN}/sendMessage").mock(
+        return_value=httpx.Response(401, text=body_with_token),
+    )
+    n = TelegramNotifier(bot_token=_TOKEN, chat_ids=(_CHAT_A,), enabled=True)
+    with structlog.testing.capture_logs() as captured:
+        await n.send("hello")
+    # We expect at least one WARN entry for the failed send.
+    warns = [e for e in captured if e.get("log_level") == "warning"]
+    assert warns, "expected at least one WARN log for 4xx response"
+    for entry in warns:
+        for key, value in entry.items():
+            text = str(value)
+            # The `bot<TOKEN>/` URL segment is the leak we MUST prevent.
+            assert f"bot{_TOKEN}/" not in text, (
+                f"`bot<token>/` segment leaked in log field {key!r}: {text!r}"
+            )
+            # And the redacted marker should be present in the body field.
+        if "body" in entry:
+            assert "<REDACTED>" in str(entry["body"]) or _TOKEN not in str(entry["body"])
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_log_does_not_contain_bot_token_on_connect_error() -> None:
+    """ConnectError str() also embeds the request URL — must NOT be logged."""
+    respx.post(f"{_TG_API}/bot{_TOKEN}/sendMessage").mock(
+        side_effect=httpx.ConnectError(
+            f"failed connecting to {_TG_API}/bot{_TOKEN}/sendMessage",
+        )
+    )
+    n = TelegramNotifier(bot_token=_TOKEN, chat_ids=(_CHAT_A,), enabled=True)
+    with structlog.testing.capture_logs() as captured:
+        await n.send("hello")
+    warns = [e for e in captured if e.get("log_level") == "warning"]
+    assert warns
+    for entry in warns:
+        for key, value in entry.items():
+            assert _TOKEN not in str(value), (
+                f"bot token leaked in log field {key!r}"
+            )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_message_html_escapes_user_fields() -> None:
+    """User-controlled fields (pool_key, profile_name, business_code, phase)
+    with `<`, `&`, `>` MUST be HTML-escaped — otherwise Telegram rejects the
+    payload with 400 under parse_mode=HTML.
+
+    Template tags like <b> and <code> stay raw because they're our own.
+    """
+    route = respx.post(f"{_TG_API}/bot{_TOKEN}/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    booking = BookingResponse(record_id=99, record_hash="h")
+    text = format_win_message(
+        slot_dt_local=_SLOT,
+        profile_name="roman & co",
+        pool_key="Evening <prime>",
+        booking=booking,
+        court_id=42,
+        phase="window <test>",
+    )
+    n = TelegramNotifier(bot_token=_TOKEN, chat_ids=(_CHAT_A,), enabled=True)
+    await n.send(text)
+    body = route.calls[0].request.read().decode("utf-8")
+    # User input is escaped:
+    assert "Evening &lt;prime&gt;" in body
+    assert "roman &amp; co" in body
+    assert "window &lt;test&gt;" in body
+    # And raw `<prime>` / `<test>` from user input MUST NOT appear:
+    assert "<prime>" not in body
+    assert "window <test>" not in body
+    # Our own template tags are still present (un-escaped):
+    assert "<b>" in body
+    assert "<code>" in body
+
+
+def test_format_lost_message_html_escapes_business_code() -> None:
+    text = format_lost_message(
+        slot_dt_local=_SLOT,
+        profile_name="r",
+        pool_key="p",
+        business_code="bad <html>",
+        phase="window",
+    )
+    assert "bad &lt;html&gt;" in text
+    assert "bad <html>" not in text
+
+
+def test_format_message_html_escapes_pool_key_with_ampersand() -> None:
+    text = format_timeout_message(
+        slot_dt_local=_SLOT,
+        profile_name="r",
+        pool_key="A & B",
+        phase="poll",
+        duration_ms=100,
+        shots_fired=1,
+    )
+    assert "A &amp; B" in text
+    assert "pool: A & B\n" not in text  # raw ampersand line not present

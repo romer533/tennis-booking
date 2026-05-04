@@ -11,6 +11,8 @@ and dev runs.
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 from datetime import datetime
 
 import httpx
@@ -21,6 +23,7 @@ from tennis_booking.common.tz import ALMATY
 
 __all__ = [
     "TelegramNotifier",
+    "disabled_notifier",
     "format_lost_message",
     "format_slot_for_user",
     "format_timeout_message",
@@ -31,6 +34,15 @@ _logger = structlog.get_logger(__name__)
 _TELEGRAM_API_BASE = "https://api.telegram.org"
 _DEFAULT_TIMEOUT_S = 5.0
 _WEEKDAY_ABBREV = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+# Redacts the bot-token segment from any URL-shaped string. httpx exception
+# messages embed the full request URL (incl. /bot<TOKEN>/...), so we MUST scrub
+# it before logging or the token leaks into journalctl.
+_TOKEN_URL_RE = re.compile(r"/bot[^/\s]+/")
+
+
+def _redact_token(text: str) -> str:
+    """Replace `/bot<TOKEN>/` with `/bot<REDACTED>/` in any string."""
+    return _TOKEN_URL_RE.sub("/bot<REDACTED>/", text)
 
 
 class TelegramNotifier:
@@ -83,11 +95,32 @@ class TelegramNotifier:
                 self._log.info("telegram_sent", chat_id=chat_id)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 — best-effort by design
+            except httpx.HTTPStatusError as exc:
+                # 4xx/5xx response — log status + truncated body (≤200 chars).
+                # Do NOT log str(exc) because it embeds the full request URL,
+                # which contains the bot token in plaintext.
+                body = exc.response.text[:200] if exc.response is not None else ""
                 self._log.warning(
                     "telegram_send_failed",
                     chat_id=chat_id,
-                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                    status_code=exc.response.status_code if exc.response is not None else None,
+                    body=_redact_token(body),
+                )
+            except httpx.RequestError as exc:
+                # Connect/Timeout/etc. — log only the type. exc.args / str(exc)
+                # may contain the request URL, so we deliberately drop them.
+                self._log.warning(
+                    "telegram_send_failed",
+                    chat_id=chat_id,
+                    exc_type=type(exc).__name__,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort by design
+                # Last-resort catch-all: log only the exception type to avoid
+                # any chance of a token-bearing message leaking through.
+                self._log.warning(
+                    "telegram_send_failed",
+                    chat_id=chat_id,
                     exc_type=type(exc).__name__,
                 )
 
@@ -134,11 +167,15 @@ def _common_lines(
     pool_key: str | None,
     court_id: int | None,
 ) -> list[str]:
+    # User-controlled string fields go through html.escape so that `<`, `&`, `>`
+    # in YAML configs (e.g. pool_key="Evening <prime>") don't make Telegram
+    # reject the message with 400 Bad Request under parse_mode=HTML. Template
+    # tags like <b>/<code> below are NOT escaped — they're our own.
     lines = [
         f"slot: <code>{format_slot_for_user(slot_dt_local)}</code>",
-        f"profile: {profile_name}",
+        f"profile: {html.escape(profile_name)}",
     ]
-    pool_part = pool_key if pool_key else "—"
+    pool_part = html.escape(pool_key) if pool_key else "—"
     court_part = f"#{court_id}" if court_id is not None else ""
     pool_line = f"pool: {pool_part}".rstrip()
     if court_part:
@@ -159,7 +196,7 @@ def format_win_message(
     lines = ["✅ <b>Бронь забронирована</b>"]
     lines.extend(_common_lines(slot_dt_local, profile_name, pool_key, court_id))
     lines.append(f"record: <code>{booking.record_id}</code>")
-    lines.append(f"phase: {phase}")
+    lines.append(f"phase: {html.escape(phase)}")
     return "\n".join(lines)
 
 
@@ -174,7 +211,7 @@ def format_timeout_message(
 ) -> str:
     lines = ["⏱️ <b>Не успели</b>"]
     lines.extend(_common_lines(slot_dt_local, profile_name, pool_key, court_id=None))
-    lines.append(f"phase: {phase}")
+    lines.append(f"phase: {html.escape(phase)}")
     lines.append(f"duration: {int(duration_ms)}ms")
     lines.append(f"shots_fired: {shots_fired}")
     return "\n".join(lines)
@@ -190,8 +227,9 @@ def format_lost_message(
 ) -> str:
     lines = ["❌ <b>Слот занят / отказан</b>"]
     lines.extend(_common_lines(slot_dt_local, profile_name, pool_key, court_id=None))
-    lines.append(f"phase: {phase}")
-    lines.append(f"code: {business_code or '—'}")
+    lines.append(f"phase: {html.escape(phase)}")
+    code_part = html.escape(business_code) if business_code else "—"
+    lines.append(f"code: {code_part}")
     return "\n".join(lines)
 
 
@@ -200,6 +238,3 @@ def disabled_notifier() -> TelegramNotifier:
     constructors so tests and unconfigured dev runs work without ceremony.
     """
     return TelegramNotifier(bot_token=None, chat_ids=(), enabled=False)
-
-
-__all__.append("disabled_notifier")

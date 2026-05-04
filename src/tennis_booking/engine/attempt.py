@@ -240,6 +240,10 @@ class BookingAttempt:
         self._store = store
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
         self._notifier = notifier if notifier is not None else disabled_notifier()
+        # Strong refs to fire-and-forget notification tasks. Without this, GC
+        # may collect the task before it completes (Python docs warn that
+        # asyncio.create_task only holds a weakref). Discarded via done-callback.
+        self._notification_tasks: set[asyncio.Task[None]] = set()
         # SystemRandom for production (CSPRNG, no seedable state shared with code
         # under test); injectable for reproducible tests of subset selection.
         self._rng: random.Random = rng if rng is not None else random.SystemRandom()
@@ -1457,4 +1461,6 @@ class BookingAttempt:
             # Called outside an event loop (defensive — should not happen in
             # production, but unit-test callers may construct results synchronously).
             return
-        asyncio.create_task(self._notifier.send(text))
+        task = asyncio.create_task(self._notifier.send(text))
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_tasks.discard)

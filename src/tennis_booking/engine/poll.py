@@ -142,6 +142,10 @@ class PollAttempt:
         self._cache = cache
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
         self._notifier = notifier if notifier is not None else disabled_notifier()
+        # Strong refs to fire-and-forget notification tasks. Without this, GC
+        # may collect the task before it completes (Python docs warn that
+        # asyncio.create_task only holds a weakref). Discarded via done-callback.
+        self._notification_tasks: set[asyncio.Task[None]] = set()
         # When pool_key is not provided, fall back to a deterministic synthetic
         # key derived from the full court_ids tuple. This guarantees that polls
         # which differ ONLY by profile (same date, same staff_ids) coalesce,
@@ -854,4 +858,6 @@ class PollAttempt:
             asyncio.get_running_loop()
         except RuntimeError:
             return
-        asyncio.create_task(self._notifier.send(text))
+        task = asyncio.create_task(self._notifier.send(text))
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_tasks.discard)

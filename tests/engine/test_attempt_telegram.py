@@ -158,6 +158,66 @@ async def test_window_attempt_calls_notifier_on_lost(
     assert "code: slot_busy" in notifier.sent[0]
 
 
+# ---- Fire-and-forget task retention ---------------------------------------
+
+
+class BlockingNotifier(TelegramNotifier):
+    """Notifier whose send() blocks on an event so we can inspect retention."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        super().__init__(bot_token="fake", chat_ids=("111",), enabled=True)
+        self._gate = gate
+        self.sent: list[str] = []
+
+    async def send(self, text: str) -> None:  # type: ignore[override]
+        await self._gate.wait()
+        self.sent.append(text)
+
+
+async def test_fire_and_forget_notification_not_gcd(
+    attempt_config: Callable[..., AttemptConfig],
+    fake_client: Callable[..., FakeAltegioClient],
+    make_clock: Callable[..., FakeClock],
+    window_open: datetime,
+    patch_codes: Any,
+) -> None:
+    """Regression: `asyncio.create_task` only holds a weakref. The terminal
+    notification task MUST be stored in `_notification_tasks` so GC can't
+    collect it before completion. Once done, the done-callback discards it.
+    """
+    patch_codes(frozenset({"not_yet_open"}), frozenset({"slot_busy"}))
+    clock = make_clock()
+    client = fake_client([_business("slot_busy")])
+    cfg = attempt_config(parallel_shots=1)
+    gate = asyncio.Event()
+    notifier = BlockingNotifier(gate)
+
+    attempt = BookingAttempt(
+        cfg, as_altegio_client(client), as_clock(clock), notifier=notifier
+    )
+    result = await attempt.run(window_open)
+
+    # While the notifier is still blocked on the gate, the task must be retained.
+    assert result.status == "lost"
+    # Yield once so the create_task scheduling actually runs.
+    await asyncio.sleep(0)
+    assert len(attempt._notification_tasks) == 1, (
+        "fire-and-forget task must be retained until done"
+    )
+
+    # Release notifier, await completion, then ensure done-callback discarded it.
+    gate.set()
+    # Drain until the task finishes (bounded — single task).
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not attempt._notification_tasks:
+            break
+    assert len(attempt._notification_tasks) == 0, (
+        "done-callback must discard the task from the retention set"
+    )
+    assert notifier.sent and "Слот занят" in notifier.sent[0]
+
+
 # ---- ERROR path → no notify ------------------------------------------------
 
 
