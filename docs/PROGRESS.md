@@ -19,6 +19,7 @@
 | [#24](https://github.com/romer533/tennis-booking/pull/24) | **cf-ray logging**: `_log_cloudflare_challenge` теперь пишет `cf_ray`, `cf_mitigated`, `cf_cache_status` headers. Подготовка к whitelist request админу Daulet — нужны конкретные cf-ray IDs для CF support trace. 4 теста |
 | [#25](https://github.com/romer533/tennis-booking/pull/25) | **Defensive Cloudflare mitigation**: Daulet отказал в whitelist → переключаемся на снижение burst rate. (1) `BookingRule.max_parallel_shots: int\|None` — cap fan-out до random subset (config: 3). Initial burst 77 → 33 POSTs. (2) Exponential backoff на transport retry: CF cause 100/200/400/800/1600/2000ms cap 2000, other transport 50/100/200/400/500ms cap 500. Per-shot tasks — backoff не блокирует sibling. Skip retry если deadline-now < delay+0.1s. 25 тестов. Schedule.yaml на сервере обновлён `max_parallel_shots: 3` для всех 59 bookings. **Verified в проде (30.04 fire):** CF block rate 75% → 0.2% (375× reduction), 1 win через window phase впервые! |
 | [#26](https://github.com/romer533/tennis-booking/pull/26) | **Poll cap parallel_shots** (PR #25 follow-up): cap не применялся в `PollAttempt._fire_shots`. Production observation 30.04 11:23: post-window poll detected bookable → 7 shots без cap → 1 win + 1 duplicate (646335329). PR симметрично применяет cap в poll fire path. Все 4 phase теперь под cap (window, post-window, pre-window poll, post-window poll). 6 тестов |
+| [#27](https://github.com/romer533/tennis-booking/pull/27) | **Auto-cancel duplicate bookings**: user reverses предыдущее решение "отменю руками" — после 2 duplicates просит автоматическую отмену. `AltegioClient.cancel_booking(record_id, record_hash)` — DELETE на predicted URL `/api/v1/booking/locations/{company_id}/attendances/{record_id}/?hash=...&bookform_id=...`. `_cancel_duplicates` helper в window/grace/poll phase — best-effort с verbose logging (`cancel_response_status_code` field). Feature flag `TENNIS_CANCEL_DUPLICATES_ENABLED` default `true`. URL — predicted, требует verification после первого prod-cancel. 27 тестов |
 
 ## Замержено в main (MVP)
 
@@ -34,7 +35,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 1091 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1118 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
