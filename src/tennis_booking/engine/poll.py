@@ -17,6 +17,13 @@ from tennis_booking.altegio import (
 )
 from tennis_booking.common.clock import Clock
 from tennis_booking.common.tz import ALMATY
+from tennis_booking.obs.telegram import (
+    TelegramNotifier,
+    disabled_notifier,
+    format_lost_message,
+    format_timeout_message,
+    format_win_message,
+)
 from tennis_booking.persistence import BookedSlot, BookingStore
 from tennis_booking.persistence.models import SCHEMA_VERSION
 
@@ -123,6 +130,7 @@ class PollAttempt:
         pool_key: str | None = None,
         rng: random.Random | None = None,
         cancel_duplicates_enabled: bool = True,
+        notifier: TelegramNotifier | None = None,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
@@ -133,6 +141,7 @@ class PollAttempt:
         self._post_window_mode = post_window_mode
         self._cache = cache
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
+        self._notifier = notifier if notifier is not None else disabled_notifier()
         # When pool_key is not provided, fall back to a deterministic synthetic
         # key derived from the full court_ids tuple. This guarantees that polls
         # which differ ONLY by profile (same date, same staff_ids) coalesce,
@@ -600,6 +609,7 @@ class PollAttempt:
                     duplicates=len(duplicates),
                 )
                 await self._cancel_duplicates(duplicates, dup_courts)
+                await self._notify_win(won_booking, won_court_id)
                 return self._make_result(
                     status="won",
                     booking=won_booking,
@@ -782,7 +792,7 @@ class PollAttempt:
         # already only knows about these two engine paths. The post-window
         # nuance is preserved in structlog bindings ("phase": "post_window_poll")
         # for telemetry without expanding the public type surface.
-        return AttemptResult(
+        result = AttemptResult(
             status=status,
             booking=booking,
             duplicates=duplicates,
@@ -796,3 +806,52 @@ class PollAttempt:
             attempt_id=self._attempt_id,
             phase="poll",
         )
+        self._schedule_terminal_notification(result)
+        return result
+
+    async def _notify_win(self, booking: BookingResponse, court_id: int) -> None:
+        if not self._notifier.is_active:
+            return
+        text = format_win_message(
+            slot_dt_local=self._config.slot_dt_local,
+            profile_name=self._config.profile_name,
+            pool_key=self._config.pool_key,
+            booking=booking,
+            court_id=court_id,
+            phase="poll",
+        )
+        await self._notifier.send(text)
+
+    def _schedule_terminal_notification(self, result: AttemptResult) -> None:
+        """Fire a Telegram message for timeout / lost terminal results.
+
+        Win is handled separately in `_notify_win`. Error and `won_by_sibling`
+        lost (cross-profile dedup) are intentionally silent. Dispatch is
+        fire-and-forget to keep `_make_result` synchronous.
+        """
+        if not self._notifier.is_active:
+            return
+        if result.status == "timeout":
+            text = format_timeout_message(
+                slot_dt_local=self._config.slot_dt_local,
+                profile_name=self._config.profile_name,
+                pool_key=self._config.pool_key,
+                phase=result.phase or "poll",
+                duration_ms=result.duration_ms,
+                shots_fired=result.shots_fired,
+            )
+        elif result.status == "lost" and result.business_code != "won_by_sibling":
+            text = format_lost_message(
+                slot_dt_local=self._config.slot_dt_local,
+                profile_name=self._config.profile_name,
+                pool_key=self._config.pool_key,
+                business_code=result.business_code,
+                phase=result.phase or "poll",
+            )
+        else:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        asyncio.create_task(self._notifier.send(text))

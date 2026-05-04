@@ -19,6 +19,13 @@ from tennis_booking.altegio import (
 from tennis_booking.common.clock import Clock
 from tennis_booking.common.tz import ALMATY
 from tennis_booking.config.schema import GracePollingConfig
+from tennis_booking.obs.telegram import (
+    TelegramNotifier,
+    disabled_notifier,
+    format_lost_message,
+    format_timeout_message,
+    format_win_message,
+)
 from tennis_booking.persistence import BookedSlot, BookingStore
 from tennis_booking.persistence.models import PROFILE_NAME_RE, SCHEMA_VERSION
 
@@ -225,12 +232,14 @@ class BookingAttempt:
         rng: random.Random | None = None,
         *,
         cancel_duplicates_enabled: bool = True,
+        notifier: TelegramNotifier | None = None,
     ) -> None:
         self._config = config
         self._client = client
         self._clock = clock
         self._store = store
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
+        self._notifier = notifier if notifier is not None else disabled_notifier()
         # SystemRandom for production (CSPRNG, no seedable state shared with code
         # under test); injectable for reproducible tests of subset selection.
         self._rng: random.Random = rng if rng is not None else random.SystemRandom()
@@ -558,6 +567,7 @@ class BookingAttempt:
                         duplicates=len(duplicates),
                     )
                     await self._cancel_duplicates(duplicates, dup_courts)
+                    await self._notify_win(won_booking, won_court_id, "window")
                     return self._make_result(
                         status="won",
                         booking=won_booking,
@@ -1299,6 +1309,7 @@ class BookingAttempt:
                 # before grace started.
                 grace_dups_only = duplicates[len(duplicates) - len(grace_dup_courts):]
                 await self._cancel_duplicates(grace_dups_only, grace_dup_courts)
+                await self._notify_win(won_booking, won_court_id, "window")
                 return self._make_result(
                     status="won",
                     booking=won_booking,
@@ -1373,7 +1384,7 @@ class BookingAttempt:
         shots_fired: int,
     ) -> AttemptResult:
         duration_ms = (self._clock.monotonic() - start_mono) * 1000.0
-        return AttemptResult(
+        result = AttemptResult(
             status=status,
             booking=booking,
             duplicates=duplicates,
@@ -1387,3 +1398,63 @@ class BookingAttempt:
             attempt_id=self._attempt_id,
             phase="window",
         )
+        self._schedule_terminal_notification(result)
+        return result
+
+    async def _notify_win(
+        self,
+        booking: BookingResponse,
+        court_id: int,
+        phase: Literal["window", "poll"],
+    ) -> None:
+        if not self._notifier.is_active:
+            return
+        text = format_win_message(
+            slot_dt_local=self._config.slot_dt_local,
+            profile_name=self._config.profile_name,
+            pool_key=self._config.pool_key,
+            booking=booking,
+            court_id=court_id,
+            phase=phase,
+        )
+        # Awaited synchronously: `send()` is best-effort and never raises, so
+        # blocking here is bounded by the per-request 5s timeout. Doing this
+        # synchronously avoids an orphan task when the engine returns into a
+        # parent that completes immediately.
+        await self._notifier.send(text)
+
+    def _schedule_terminal_notification(self, result: AttemptResult) -> None:
+        """Fire a Telegram message for timeout / lost terminal results.
+
+        Win is handled separately in `_notify_win` (needs court_id). Error and
+        `won_by_sibling` lost (cross-profile dedup) are intentionally silent.
+        Dispatch is fire-and-forget so `_make_result` stays synchronous.
+        """
+        if not self._notifier.is_active:
+            return
+        if result.status == "timeout":
+            text = format_timeout_message(
+                slot_dt_local=self._config.slot_dt_local,
+                profile_name=self._config.profile_name,
+                pool_key=self._config.pool_key,
+                phase=result.phase or "window",
+                duration_ms=result.duration_ms,
+                shots_fired=result.shots_fired,
+            )
+        elif result.status == "lost" and result.business_code != "won_by_sibling":
+            text = format_lost_message(
+                slot_dt_local=self._config.slot_dt_local,
+                profile_name=self._config.profile_name,
+                pool_key=self._config.pool_key,
+                business_code=result.business_code,
+                phase=result.phase or "window",
+            )
+        else:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Called outside an event loop (defensive — should not happen in
+            # production, but unit-test callers may construct results synchronously).
+            return
+        asyncio.create_task(self._notifier.send(text))

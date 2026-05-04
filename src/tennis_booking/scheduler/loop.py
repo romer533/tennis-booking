@@ -20,6 +20,7 @@ from tennis_booking.engine.attempt import (
 )
 from tennis_booking.engine.poll import PollAttempt, PollConfigData
 from tennis_booking.engine.poll_cache import PollResultCache
+from tennis_booking.obs.telegram import TelegramNotifier, disabled_notifier
 from tennis_booking.persistence import BookingStore
 from tennis_booking.scheduler.clock import CheckResult, check_ntp_drift
 from tennis_booking.scheduler.clock_errors import (
@@ -118,7 +119,10 @@ def _default_attempt_factory(
     return BookingAttempt(config, client, clock, store=store)
 
 
-def _make_default_attempt_factory(cancel_duplicates_enabled: bool) -> AttemptFactory:
+def _make_default_attempt_factory(
+    cancel_duplicates_enabled: bool,
+    notifier: TelegramNotifier,
+) -> AttemptFactory:
     def _factory(
         config: AttemptConfig,
         client: AltegioClient,
@@ -131,6 +135,7 @@ def _make_default_attempt_factory(cancel_duplicates_enabled: bool) -> AttemptFac
             clock,
             store=store,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
+            notifier=notifier,
         )
 
     return _factory
@@ -139,6 +144,7 @@ def _make_default_attempt_factory(cancel_duplicates_enabled: bool) -> AttemptFac
 def _make_default_poll_attempt_factory(
     cache: PollResultCache | None,
     cancel_duplicates_enabled: bool,
+    notifier: TelegramNotifier,
 ) -> PollAttemptFactory:
     """Build the production PollAttempt factory. Closes over the loop's shared
     `PollResultCache` so every spawned PollAttempt consults the same cache —
@@ -163,6 +169,7 @@ def _make_default_poll_attempt_factory(
             cache=cache,
             pool_key=config.pool_key,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
+            notifier=notifier,
         )
 
     return _factory
@@ -171,6 +178,7 @@ def _make_default_poll_attempt_factory(
 def _make_default_post_window_poll_factory(
     cache: PollResultCache | None,
     cancel_duplicates_enabled: bool,
+    notifier: TelegramNotifier,
 ) -> PostWindowPollFactory:
     def _factory(
         config: AttemptConfig,
@@ -191,6 +199,7 @@ def _make_default_post_window_poll_factory(
             cache=cache,
             pool_key=config.pool_key,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
+            notifier=notifier,
         )
 
     return _factory
@@ -255,6 +264,7 @@ class SchedulerLoop:
         post_window_poll_interval_s: int = DEFAULT_POST_WINDOW_POLL_INTERVAL_S,
         post_window_poll_enabled: bool = True,
         cancel_duplicates_enabled: bool = True,
+        notifier: TelegramNotifier | None = None,
     ) -> None:
         if min_lead_time_hours < 0.0 or min_lead_time_hours > 168.0:
             raise ValueError(
@@ -276,10 +286,11 @@ class SchedulerLoop:
         self._post_window_poll_interval_s = post_window_poll_interval_s
         self._post_window_poll_enabled = post_window_poll_enabled
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
+        self._notifier = notifier if notifier is not None else disabled_notifier()
         self._attempt_factory: AttemptFactory = (
             attempt_factory
             if attempt_factory is not None
-            else _make_default_attempt_factory(cancel_duplicates_enabled)
+            else _make_default_attempt_factory(cancel_duplicates_enabled, self._notifier)
         )
         # Shared poll-result cache for the lifetime of this SchedulerLoop.
         # TTL == post_window_poll_interval_s (the default poll cadence). Both
@@ -294,14 +305,14 @@ class SchedulerLoop:
             poll_attempt_factory
             if poll_attempt_factory is not None
             else _make_default_poll_attempt_factory(
-                self._poll_cache, cancel_duplicates_enabled
+                self._poll_cache, cancel_duplicates_enabled, self._notifier
             )
         )
         self._post_window_poll_factory: PostWindowPollFactory = (
             post_window_poll_factory
             if post_window_poll_factory is not None
             else _make_default_post_window_poll_factory(
-                self._poll_cache, cancel_duplicates_enabled
+                self._poll_cache, cancel_duplicates_enabled, self._notifier
             )
         )
         self._ntp_checker: NTPChecker = (

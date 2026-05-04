@@ -104,6 +104,12 @@ ALTEGIO_BEARER_TOKEN=
 # TENNIS_NTP_REQUIRED=1            # set 0 only in dev with no NTP
 # TENNIS_POST_WINDOW_POLL_ENABLED=1     # set 0 to disable post-window cancellation polling
 # TENNIS_CANCEL_DUPLICATES_ENABLED=1     # set 0 to disable auto-cancel of duplicates
+
+# Telegram notifications (opt-in; all four lines required for live messages).
+# TELEGRAM_BOT_TOKEN=
+# TELEGRAM_PERSONAL_CHAT_ID=
+# TELEGRAM_GROUP_CHAT_ID=
+# TELEGRAM_NOTIFICATIONS_ENABLED=0     # set 1 to enable Telegram messages
 EOF
     chown "root:$SERVICE_GROUP" "$CONFIG_DIR/env"
     chmod 0640 "$CONFIG_DIR/env"
