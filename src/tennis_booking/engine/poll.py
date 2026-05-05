@@ -37,6 +37,11 @@ _logger = structlog.get_logger(__name__)
 
 _PER_SHOT_TIMEOUT_S = 5.0
 _SEARCH_TIMEOUT_S = 5.0
+# Atomic search/staff check happens in the latency-critical "after detect, before
+# fire" gap. 200ms is the hard ceiling — if the server is slower than this our
+# detection signal is already stale and the cap=1 advantage of the atomic list
+# evaporates, so we'd rather fall back to blind random against the full pool.
+_ATOMIC_CHECK_TIMEOUT_S = 0.2
 
 # Jitter envelope around interval_s to break synchronised polling waves.
 # Initial jitter: U(0, _INITIAL_JITTER_FRAC * interval_s) one-shot before the
@@ -131,6 +136,7 @@ class PollAttempt:
         rng: random.Random | None = None,
         cancel_duplicates_enabled: bool = True,
         notifier: TelegramNotifier | None = None,
+        atomic_search_before_fire_enabled: bool = True,
     ) -> None:
         self._config = attempt_config
         self._poll = poll
@@ -142,6 +148,7 @@ class PollAttempt:
         self._cache = cache
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
         self._notifier = notifier if notifier is not None else disabled_notifier()
+        self._atomic_search_before_fire_enabled = atomic_search_before_fire_enabled
         # Strong refs to fire-and-forget notification tasks. Without this, GC
         # may collect the task before it completes (Python docs warn that
         # asyncio.create_task only holds a weakref). Discarded via done-callback.
@@ -438,25 +445,109 @@ class PollAttempt:
             return list(self._config.court_ids)
         return None
 
-    def _select_active_court_ids(self) -> tuple[int, ...]:
+    def _select_active_court_ids(
+        self, bookable_subset: tuple[int, ...] | None = None
+    ) -> tuple[int, ...]:
         """Pick a subset of court_ids to fan out over for this fire.
 
-        Pool mode (len > 1): if max_parallel_shots is set and < pool size,
+        When `bookable_subset` is provided (atomic check succeeded) the random
+        sample is restricted to its intersection with the configured pool.
+        Otherwise the legacy pool-wide subset selection runs.
+
+        Pool mode (len > 1): if max_parallel_shots is set and < eligible size,
         sample WITHOUT replacement to avoid duplicate POSTs on the same court
         and to cap the per-fire request count (Cloudflare rate-rule defense
         — see docs/incidents/2026-04-30-poll-fanout-duplicate.md context).
-        Otherwise return the full pool (legacy behaviour, backward compat).
+        Otherwise return the full eligible set (legacy behaviour, backward
+        compat).
 
         Single-court (len == 1): always return as-is — there is nothing to
         sample down to and parallel_shots semantics from BookingAttempt do
         not apply to poll fire (poll always fires exactly one shot per court).
         """
         all_ids = self._config.court_ids
+        if bookable_subset is not None:
+            bookable_set = set(bookable_subset)
+            eligible = tuple(cid for cid in all_ids if cid in bookable_set)
+            if not eligible:
+                return all_ids
+        else:
+            eligible = all_ids
+
         cap = self._config.max_parallel_shots
-        if cap is None or len(all_ids) <= 1 or cap >= len(all_ids):
-            return all_ids
-        sampled = self._rng.sample(list(all_ids), cap)
+        if cap is None or len(eligible) <= 1 or cap >= len(eligible):
+            return eligible
+        sampled = self._rng.sample(list(eligible), cap)
         return tuple(sampled)
+
+    async def _just_in_time_atomic_check(self) -> tuple[int, ...] | None:
+        """Best-effort: ask Altegio "which staff is bookable RIGHT NOW for this
+        datetime?" and return the intersection with our pool. None means the
+        check was disabled or failed — caller should fall back to blind random.
+
+        Latency is bounded by `_ATOMIC_CHECK_TIMEOUT_S` (200ms). Slower than
+        that and the signal is already stale — return None to fall back rather
+        than burn fire latency we'd lose anyway.
+        """
+        if not self._atomic_search_before_fire_enabled:
+            return None
+
+        try:
+            entries = await asyncio.wait_for(
+                self._client.search_staff_at_datetime(
+                    datetime_local=self._config.slot_dt_local,
+                    service_id=self._config.service_id,
+                    timeout_s=_ATOMIC_CHECK_TIMEOUT_S,
+                ),
+                timeout=_ATOMIC_CHECK_TIMEOUT_S,
+            )
+        except TimeoutError:
+            self._log.warning(
+                "atomic_check_failed_falling_back_to_blind",
+                error_type="timeout",
+                timeout_s=_ATOMIC_CHECK_TIMEOUT_S,
+            )
+            return None
+        except AltegioBusinessError as e:
+            self._log.warning(
+                "atomic_check_failed_falling_back_to_blind",
+                error_type="business",
+                code=e.code,
+                http_status=e.http_status,
+            )
+            return None
+        except AltegioTransportError as e:
+            self._log.warning(
+                "atomic_check_failed_falling_back_to_blind",
+                error_type="transport",
+                cause=e.cause,
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — must never crash fire path
+            self._log.warning(
+                "atomic_check_failed_falling_back_to_blind",
+                error_type="unknown",
+                exc_type=type(e).__name__,
+                error=str(e),
+            )
+            return None
+
+        pool_set = set(self._config.court_ids)
+        bookable_ids = tuple(
+            entry.staff_id
+            for entry in entries
+            if entry.is_bookable and entry.staff_id in pool_set
+        )
+        self._log.info(
+            "atomic_check_bookable_courts",
+            count=len(bookable_ids),
+            bookable_staff_ids=list(bookable_ids),
+            pool_size=len(self._config.court_ids),
+            response_size=len(entries),
+        )
+        return bookable_ids
 
     def _is_too_close_to_slot(self) -> bool:
         """True если до slot_dt_local осталось меньше min_lead_time_hours.
@@ -493,7 +584,24 @@ class PollAttempt:
         fired_at_utc = self._clock.now_utc()
         self._log.info("poll_fire_at", fired_at_utc=fired_at_utc.isoformat())
 
-        active_court_ids = self._select_active_court_ids()
+        bookable_subset = await self._just_in_time_atomic_check()
+        if bookable_subset is not None and not bookable_subset:
+            self._log.info(
+                "no_bookable_courts_at_fire",
+                pool_size=len(self._config.court_ids),
+            )
+            return self._make_result(
+                status="lost",
+                booking=None,
+                duplicates=(),
+                fired_at_utc=fired_at_utc,
+                response_at_utc=None,
+                start_mono=start_mono,
+                business_code="no_bookable_at_fire",
+                transport_cause=None,
+                shots_fired=0,
+            )
+        active_court_ids = self._select_active_court_ids(bookable_subset)
         if active_court_ids != self._config.court_ids:
             self._log.info(
                 "poll_active_court_subset_selected",

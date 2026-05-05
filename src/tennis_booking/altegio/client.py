@@ -14,18 +14,26 @@ from tennis_booking.common.tz import ALMATY
 
 from .config import AltegioConfig
 from .errors import AltegioBusinessError, AltegioTransportError
-from .models import BookingAppointment, BookingRequest, BookingResponse, TimeSlot
+from .models import (
+    BookableStaff,
+    BookingAppointment,
+    BookingRequest,
+    BookingResponse,
+    TimeSlot,
+)
 
 __all__ = [
     "ALMATY",
     "BOOK_RECORD_PATH",
     "CANCEL_BOOKING_PATH",
+    "SEARCH_STAFF_PATH",
     "SEARCH_TIMESLOTS_PATH",
     "AltegioClient",
 ]
 
 BOOK_RECORD_PATH = "/api/v1/book_record/{company_id}"
 SEARCH_TIMESLOTS_PATH = "/api/v1/booking/search/timeslots/"
+SEARCH_STAFF_PATH = "/api/v1/booking/search/staff"
 # Predicted from REST convention against the existing GET endpoint
 # documented in docs/api-research.md (Запрос E3). Real DELETE HAR not yet
 # captured — verify cancel_response_status_code in logs after first deploy.
@@ -254,6 +262,215 @@ class AltegioClient:
         }
 
         return await self._post_search_timeslots(body, timeout_s=timeout_s)
+
+    async def search_staff_at_datetime(
+        self,
+        *,
+        datetime_local: datetime,
+        service_id: int,
+        timeout_s: float | None = None,
+    ) -> list[BookableStaff]:
+        """POST /api/v1/booking/search/staff — atomic check какие courts bookable
+        в конкретный datetime.
+
+        Used in poll-mode just before fire to filter the random court selection
+        down to the subset Altegio currently considers free. Server-side fan-out
+        means one POST returns the answer for all staff at once.
+
+        Args:
+            datetime_local: tz-aware Almaty datetime — момент, для которого
+                проверяется доступность.
+            service_id: Altegio service id.
+            timeout_s: optional read-timeout override (hot path).
+
+        Returns:
+            list[BookableStaff], one entry per staff Altegio considers a
+            candidate. Caller filters where `is_bookable=True`. Dry-run
+            client returns []  без сетевого вызова.
+
+        Raises:
+            ValueError: pre-flight (naive datetime, wrong TZ, bad service_id).
+            AltegioBusinessError: 4xx (invalid datetime, unauthorized, ...).
+            AltegioTransportError: 5xx, network error, Cloudflare challenge,
+                non-JSON 2xx.
+        """
+        if datetime_local.tzinfo is None:
+            raise ValueError("datetime_local must be timezone-aware")
+        if datetime_local.tzinfo != ALMATY:
+            raise ValueError(
+                f"datetime_local must be in Asia/Almaty, got {datetime_local.tzinfo}"
+            )
+        if service_id < 1:
+            raise ValueError(f"service_id must be >= 1, got {service_id}")
+
+        if self._config.dry_run:
+            _logger.info(
+                "[DRY RUN] would POST %s datetime=%s service_id=%d",
+                SEARCH_STAFF_PATH,
+                datetime_local.isoformat(),
+                service_id,
+            )
+            return []
+
+        body: dict[str, Any] = {
+            "context": {"location_id": self._config.company_id},
+            "filter": {
+                "datetime": datetime_local.isoformat(),
+                "records": [
+                    {
+                        "staff_id": None,
+                        "attendance_service_items": [
+                            {"type": "service", "id": service_id}
+                        ],
+                    }
+                ],
+            },
+        }
+
+        return await self._post_search_staff(body, timeout_s=timeout_s)
+
+    async def _post_search_staff(
+        self, body: dict[str, Any], *, timeout_s: float | None
+    ) -> list[BookableStaff]:
+        http = self._require_http()
+        headers = {
+            "Authorization": f"Bearer {self._config.bearer_token.get_secret_value()}",
+            "Content-Type": "application/json",
+            "accept": "application/json, text/plain, */*",
+        }
+        kwargs: dict[str, Any] = {"json": body, "headers": headers}
+        if timeout_s is not None:
+            kwargs["timeout"] = httpx.Timeout(
+                connect=_DEFAULT_TIMEOUT.connect,
+                read=timeout_s,
+                write=timeout_s,
+                pool=_DEFAULT_TIMEOUT.pool,
+            )
+
+        try:
+            response = await http.post(SEARCH_STAFF_PATH, **kwargs)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.RemoteProtocolError,
+            httpx.TransportError,
+        ) as e:
+            raise AltegioTransportError(type(e).__name__) from e
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — narrow to transport for unknown httpx issues
+            raise AltegioTransportError(f"{type(e).__name__}: {e}") from e
+
+        return self._parse_search_staff_response(response)
+
+    @staticmethod
+    def _parse_search_staff_response(response: httpx.Response) -> list[BookableStaff]:
+        status = response.status_code
+
+        if 500 <= status < 600:
+            raise AltegioTransportError(f"server error {status}")
+
+        content_type = response.headers.get("content-type", "")
+        is_json = "application/json" in content_type.lower()
+
+        if _is_cloudflare_challenge(response, status=status, content_type=content_type):
+            _log_cloudflare_challenge(response, content_type=content_type)
+            raise AltegioTransportError("cloudflare_challenge")
+
+        if 400 <= status < 500:
+            code, message = _extract_business_error(response, is_json=is_json)
+            if status == 401 and code == "unknown":
+                code = "unauthorized"
+            raise AltegioBusinessError(code=code, message=message, http_status=status)
+
+        if not (200 <= status < 300):
+            raise AltegioTransportError(f"unexpected status {status}")
+
+        if not is_json:
+            raise AltegioTransportError(
+                f"non-JSON 2xx response (content-type={content_type!r})"
+            )
+        try:
+            body = response.json()
+        except ValueError as e:
+            raise AltegioTransportError(f"invalid JSON in 2xx: {e}") from e
+
+        if isinstance(body, dict):
+            data = body.get("data")
+        elif isinstance(body, list):
+            data = body
+        else:
+            raise AltegioBusinessError(
+                code="malformed_success",
+                message=f"unexpected top-level JSON type: {type(body).__name__}",
+                http_status=status,
+            )
+
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise AltegioBusinessError(
+                code="malformed_success",
+                message=f"'data' must be a list, got {type(data).__name__}",
+                http_status=status,
+            )
+
+        result: list[BookableStaff] = []
+        for idx, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}] must be a mapping, got {type(item).__name__}",
+                    http_status=status,
+                )
+            attrs_raw = item.get("attributes")
+            if not isinstance(attrs_raw, dict):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes missing or not a mapping",
+                    http_status=status,
+                )
+
+            is_bookable = attrs_raw.get("is_bookable")
+            if not isinstance(is_bookable, bool):
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].attributes.is_bookable must be bool",
+                    http_status=status,
+                )
+
+            staff_id_raw = item.get("id")
+            if isinstance(staff_id_raw, str):
+                try:
+                    staff_id = int(staff_id_raw)
+                except ValueError as e:
+                    raise AltegioBusinessError(
+                        code="malformed_success",
+                        message=f"data[{idx}].id not parseable as int: {staff_id_raw!r}",
+                        http_status=status,
+                    ) from e
+            elif isinstance(staff_id_raw, int) and not isinstance(staff_id_raw, bool):
+                staff_id = staff_id_raw
+            else:
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}].id missing or wrong type",
+                    http_status=status,
+                )
+
+            try:
+                entry = BookableStaff(staff_id=staff_id, is_bookable=is_bookable)
+            except ValidationError as e:
+                raise AltegioBusinessError(
+                    code="malformed_success",
+                    message=f"data[{idx}] invalid: {e.errors()}",
+                    http_status=status,
+                ) from e
+            result.append(entry)
+        return result
 
     async def cancel_booking(
         self,

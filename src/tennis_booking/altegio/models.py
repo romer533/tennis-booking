@@ -26,6 +26,21 @@ class TimeSlot(BaseModel):
     staff_id: int | None = None
 
 
+class BookableStaff(BaseModel):
+    """Распарсенный элемент ответа POST /booking/search/staff.
+
+    Atomic check ровно перед fire: какие именно staff_id (courts) bookable
+    в конкретный datetime. Используется PollAttempt'ом, чтобы не стрелять в
+    blind random — выбор cap=1 court из known-bookable списка повышает
+    win rate с 1/N до 1/1 при отсутствии гонки.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    staff_id: int
+    is_bookable: bool
+
+
 class BookingAppointment(BaseModel):
     """Один appointment в массиве /book_record. id=0 для новой брони."""
 

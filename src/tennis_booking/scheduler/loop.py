@@ -145,6 +145,7 @@ def _make_default_poll_attempt_factory(
     cache: PollResultCache | None,
     cancel_duplicates_enabled: bool,
     notifier: TelegramNotifier,
+    atomic_search_before_fire_enabled: bool,
 ) -> PollAttemptFactory:
     """Build the production PollAttempt factory. Closes over the loop's shared
     `PollResultCache` so every spawned PollAttempt consults the same cache —
@@ -170,6 +171,7 @@ def _make_default_poll_attempt_factory(
             pool_key=config.pool_key,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
             notifier=notifier,
+            atomic_search_before_fire_enabled=atomic_search_before_fire_enabled,
         )
 
     return _factory
@@ -179,6 +181,7 @@ def _make_default_post_window_poll_factory(
     cache: PollResultCache | None,
     cancel_duplicates_enabled: bool,
     notifier: TelegramNotifier,
+    atomic_search_before_fire_enabled: bool,
 ) -> PostWindowPollFactory:
     def _factory(
         config: AttemptConfig,
@@ -200,6 +203,7 @@ def _make_default_post_window_poll_factory(
             pool_key=config.pool_key,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
             notifier=notifier,
+            atomic_search_before_fire_enabled=atomic_search_before_fire_enabled,
         )
 
     return _factory
@@ -265,6 +269,7 @@ class SchedulerLoop:
         post_window_poll_enabled: bool = True,
         cancel_duplicates_enabled: bool = True,
         notifier: TelegramNotifier | None = None,
+        atomic_search_before_fire_enabled: bool = True,
     ) -> None:
         if min_lead_time_hours < 0.0 or min_lead_time_hours > 168.0:
             raise ValueError(
@@ -287,6 +292,7 @@ class SchedulerLoop:
         self._post_window_poll_enabled = post_window_poll_enabled
         self._cancel_duplicates_enabled = cancel_duplicates_enabled
         self._notifier = notifier if notifier is not None else disabled_notifier()
+        self._atomic_search_before_fire_enabled = atomic_search_before_fire_enabled
         self._attempt_factory: AttemptFactory = (
             attempt_factory
             if attempt_factory is not None
@@ -305,14 +311,20 @@ class SchedulerLoop:
             poll_attempt_factory
             if poll_attempt_factory is not None
             else _make_default_poll_attempt_factory(
-                self._poll_cache, cancel_duplicates_enabled, self._notifier
+                self._poll_cache,
+                cancel_duplicates_enabled,
+                self._notifier,
+                atomic_search_before_fire_enabled,
             )
         )
         self._post_window_poll_factory: PostWindowPollFactory = (
             post_window_poll_factory
             if post_window_poll_factory is not None
             else _make_default_post_window_poll_factory(
-                self._poll_cache, cancel_duplicates_enabled, self._notifier
+                self._poll_cache,
+                cancel_duplicates_enabled,
+                self._notifier,
+                atomic_search_before_fire_enabled,
             )
         )
         self._ntp_checker: NTPChecker = (

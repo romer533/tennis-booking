@@ -162,6 +162,18 @@ def _parse_cancel_duplicates_enabled(env_value: str | None) -> bool:
     return normalized not in ("0", "false", "no", "off", "")
 
 
+def _parse_atomic_search_before_fire_enabled(env_value: str | None) -> bool:
+    """TENNIS_ATOMIC_SEARCH_BEFORE_FIRE_ENABLED feature flag for the
+    just-in-time POST /booking/search/staff probe that runs between detect and
+    fire. Default True; only explicit falsy strings disable it. Same fail-safe
+    parse rules as the other boolean env helpers — typos stay True.
+    """
+    if env_value is None:
+        return True
+    normalized = env_value.strip().lower()
+    return normalized not in ("0", "false", "no", "off", "")
+
+
 def _parse_telegram_enabled(env_value: str | None) -> bool:
     """TELEGRAM_NOTIFICATIONS_ENABLED — opt-in feature flag.
 
@@ -288,6 +300,16 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "— duplicate bookings will only be logged, not cancelled"
         )
 
+    atomic_search_before_fire_enabled = _parse_atomic_search_before_fire_enabled(
+        os.environ.get("TENNIS_ATOMIC_SEARCH_BEFORE_FIRE_ENABLED")
+    )
+    if not atomic_search_before_fire_enabled:
+        logger.warning(
+            "atomic_search_before_fire_enabled=False "
+            "(TENNIS_ATOMIC_SEARCH_BEFORE_FIRE_ENABLED env override) "
+            "— poll fire will use blind random court selection"
+        )
+
     try:
         min_lead_time_hours = _parse_min_lead_time_hours(
             os.environ.get("TENNIS_MIN_LEAD_TIME_HOURS")
@@ -328,6 +350,7 @@ async def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             post_window_poll_enabled=post_window_poll_enabled,
             cancel_duplicates_enabled=cancel_duplicates_enabled,
             notifier=notifier,
+            atomic_search_before_fire_enabled=atomic_search_before_fire_enabled,
         )
         event_loop = asyncio.get_running_loop()
         _install_signal_handlers(event_loop, scheduler_loop, logger)

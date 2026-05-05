@@ -12,6 +12,7 @@ from tennis_booking.altegio import (
     AltegioBusinessError,
     AltegioConfig,
     AltegioTransportError,
+    BookableStaff,
     BookingResponse,
     TimeSlot,
 )
@@ -29,6 +30,7 @@ from .conftest import (
     STAFF_ID,
     FakeClock,
     SideEffect,
+    StaffSearchEffect,
 )
 
 
@@ -54,15 +56,20 @@ class FakePollClient:
         search_effects: list[SearchEffect] | None = None,
         booking_effects: list[SideEffect] | None = None,
         cancel_effects: list[BaseException | None] | None = None,
+        staff_search_effects: list[StaffSearchEffect] | None = None,
         config: AltegioConfig | None = None,
     ) -> None:
         self._search_effects: list[SearchEffect] = list(search_effects or [])
         self._booking_effects: list[SideEffect] = list(booking_effects or [])
         self._cancel_effects: list[BaseException | None] = list(cancel_effects or [])
+        self._staff_search_effects: list[StaffSearchEffect] = list(
+            staff_search_effects or []
+        )
         self._config = config or _config()
         self.search_calls: list[dict[str, Any]] = []
         self.booking_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[dict[str, Any]] = []
+        self.search_staff_calls: list[dict[str, Any]] = []
 
     @property
     def config(self) -> AltegioConfig:
@@ -140,6 +147,31 @@ class FakePollClient:
         if effect is None:
             return
         raise effect
+
+    async def search_staff_at_datetime(
+        self,
+        *,
+        datetime_local: datetime,
+        service_id: int,
+        timeout_s: float | None = None,
+    ) -> list[BookableStaff]:
+        self.search_staff_calls.append(
+            {
+                "datetime_local": datetime_local,
+                "service_id": service_id,
+                "timeout_s": timeout_s,
+            }
+        )
+        await asyncio.sleep(0)
+        if not self._staff_search_effects:
+            # No scripted effect → engine falls back to blind random.
+            raise AltegioTransportError("no_atomic_search_effect_scripted")
+        effect = self._staff_search_effects.pop(0)
+        if isinstance(effect, list):
+            return effect
+        if isinstance(effect, BaseException):
+            raise effect
+        return await effect()
 
 
 def as_client(fake: FakePollClient) -> AltegioClient:
