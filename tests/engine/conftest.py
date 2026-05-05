@@ -10,6 +10,8 @@ from pydantic import SecretStr
 
 from tennis_booking.altegio import (
     AltegioConfig,
+    AltegioTransportError,
+    BookableStaff,
     BookingResponse,
     TimeSlot,
 )
@@ -73,6 +75,11 @@ SearchEffect = (
     | BaseException
     | Callable[[], Awaitable[list[TimeSlot]]]
 )
+StaffSearchEffect = (
+    list[BookableStaff]
+    | BaseException
+    | Callable[[], Awaitable[list[BookableStaff]]]
+)
 
 
 class FakeAltegioClient:
@@ -89,17 +96,22 @@ class FakeAltegioClient:
         prearm_effect: BaseException | Callable[[], Awaitable[None]] | None = None,
         search_effects: list[SearchEffect] | None = None,
         cancel_effects: list[BaseException | None] | None = None,
+        staff_search_effects: list[StaffSearchEffect] | None = None,
     ) -> None:
         self._side_effects: list[SideEffect] = list(side_effects or [])
         self._config = config or _default_config()
         self._prearm_effect = prearm_effect
         self._search_effects: list[SearchEffect] = list(search_effects or [])
         self._cancel_effects: list[BaseException | None] = list(cancel_effects or [])
+        self._staff_search_effects: list[StaffSearchEffect] = list(
+            staff_search_effects or []
+        )
         self._default_side_effect: SideEffect | None = None
         self.create_booking_calls: list[dict[str, Any]] = []
         self.prearm_calls: int = 0
         self.search_timeslots_calls: list[dict[str, Any]] = []
         self.cancel_booking_calls: list[dict[str, Any]] = []
+        self.search_staff_calls: list[dict[str, Any]] = []
 
     @property
     def config(self) -> AltegioConfig:
@@ -214,6 +226,37 @@ class FakeAltegioClient:
             raise effect
         return await effect()
 
+    def add_staff_search(self, *effects: StaffSearchEffect) -> None:
+        self._staff_search_effects.extend(effects)
+
+    async def search_staff_at_datetime(
+        self,
+        *,
+        datetime_local: datetime,
+        service_id: int,
+        timeout_s: float | None = None,
+    ) -> list[BookableStaff]:
+        call = {
+            "datetime_local": datetime_local,
+            "service_id": service_id,
+            "timeout_s": timeout_s,
+        }
+        self.search_staff_calls.append(call)
+        if not self._staff_search_effects:
+            # Default behaviour: legacy tests don't script atomic check.
+            # Raise transport error so engine falls back to blind random and
+            # legacy assertions about which courts fired stay valid. Tests
+            # that exercise the atomic-check path explicitly script effects.
+            await asyncio.sleep(0)
+            raise AltegioTransportError("no_atomic_search_effect_scripted")
+        effect = self._staff_search_effects.pop(0)
+        await asyncio.sleep(0)
+        if isinstance(effect, list):
+            return effect
+        if isinstance(effect, BaseException):
+            raise effect
+        return await effect()
+
 
 def _default_config(*, dry_run: bool = False) -> AltegioConfig:
     return AltegioConfig(
@@ -255,6 +298,7 @@ def fake_client() -> Callable[..., FakeAltegioClient]:
         prearm_effect: BaseException | Callable[[], Awaitable[None]] | None = None,
         search_effects: list[SearchEffect] | None = None,
         cancel_effects: list[BaseException | None] | None = None,
+        staff_search_effects: list[StaffSearchEffect] | None = None,
     ) -> FakeAltegioClient:
         return FakeAltegioClient(
             side_effects=side_effects,
@@ -262,6 +306,7 @@ def fake_client() -> Callable[..., FakeAltegioClient]:
             prearm_effect=prearm_effect,
             search_effects=search_effects,
             cancel_effects=cancel_effects,
+            staff_search_effects=staff_search_effects,
         )
 
     return _make
@@ -328,6 +373,7 @@ __all__ = [
     "STAFF_ID",
     "SearchEffect",
     "SideEffect",
+    "StaffSearchEffect",
     "as_altegio_client",
     "as_clock",
     "attempt_config",
