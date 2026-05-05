@@ -21,6 +21,7 @@
 | [#26](https://github.com/romer533/tennis-booking/pull/26) | **Poll cap parallel_shots** (PR #25 follow-up): cap не применялся в `PollAttempt._fire_shots`. Production observation 30.04 11:23: post-window poll detected bookable → 7 shots без cap → 1 win + 1 duplicate (646335329). PR симметрично применяет cap в poll fire path. Все 4 phase теперь под cap (window, post-window, pre-window poll, post-window poll). 6 тестов |
 | [#27](https://github.com/romer533/tennis-booking/pull/27) | **Auto-cancel duplicate bookings** (DEPLOYED, FLAG OFF в проде): user попросил решение проблемы дублей. PR реализовал auto-cancel after the fact (DELETE booking при detect duplicate). User уточнил — хотел **prevention**, не cancel. PR оставлен как kill-switch ready (env `TENNIS_CANCEL_DUPLICATES_ENABLED`). В проде `=0`. Strategy switched to: schedule.yaml `max_parallel_shots: 3 → 1` — структурная гарантия 0 duplicates (1 POST max → max 1 success). Trade-off: win rate ниже на window phase (1/7 court hit вместо 3/7), но поллы продолжают ловить отмены. 27 тестов в коде. |
 | [#28](https://github.com/romer533/tennis-booking/pull/28) | **Telegram notifications**: real-time DM при win/timeout/lost (≠`won_by_sibling`). `TelegramNotifier` async best-effort sender, никогда не блокирует main flow. `parse_mode=HTML` с `html.escape()` для user-controlled fields (security). 2 rounds CR — fixed token leak в logs (specific exception handlers + `_redact_token` regex), HTML escape, fire-and-forget task GC retention. Env `TELEGRAM_NOTIFICATIONS_ENABLED` opt-in. Deployed в прод 04.05 19:15 UTC, bot `@DauletBookingBot`, DM проверен. 38 тестов |
+| [#29](https://github.com/romer533/tennis-booking/pull/29) | **Just-in-time atomic search before fire**: cap=1 blind random давал 14% win rate (1 win/день vs 5 при cap=3). Решение — атомарный POST `/api/v1/booking/search/staff` за момент до fire даёт **точный список bookable courts**. `_select_active_court_ids` фильтрует pool ∩ bookable → sample 1 random из known-free → ~100% hit rate. Hard 200мс ceiling. Fail-safe: timeout/error → blind random fallback. Empty bookable → skip fire (`no_bookable_courts_at_fire`). Feature flag `TENNIS_ATOMIC_SEARCH_BEFORE_FIRE_ENABLED` (default true). 27 тестов |
 
 ## Замержено в main (MVP)
 
@@ -36,7 +37,7 @@
 | Phase 3 — loop | [#8](https://github.com/romer533/tennis-booking/pull/8) | `scheduler/loop.py` — main daily loop, NTP guard, graceful shutdown, idempotency. service_id в config schema. 48 тестов, 95% coverage |
 | Phase 7 — deployment | [#9](https://github.com/romer533/tennis-booking/pull/9) | `__main__.py`, RotatingFileHandler logs, systemd unit, sudoers, GitHub Actions CD, DEPLOYMENT.md. 19 новых тестов |
 
-**Тестов в main:** 1156 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
+**Тестов в main:** 1183 passed + 1 skipped + 1 deselected. Покрытие критичных модулей ≥ 95%.
 
 ## Production status
 
